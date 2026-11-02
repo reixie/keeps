@@ -1,0 +1,9 @@
+{
+  "name": "Keeps",
+  "identifier": "com.reixie.keeps",
+  "version": "0.1.0",
+  "out": "build",
+  "macos": {
+    "minimumSystemVersion": "13.0"
+  }
+}

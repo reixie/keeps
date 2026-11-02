@@ -1,0 +1,53 @@
+# App bundles, native adapters, and build caches
+/build/
+/dist/
+/.mygo/
+/.cache/
+/resources/darwin-*/KeepsMedia
+/resources/darwin-*/libKeepsPlayback.dylib
+/keeps
+/Keeps
+mygo_windows_*.syso
+*.app/
+*.dmg
+*.pkg
+*.dSYM/
+*.o
+*.a
+*.dylib
+*.test
+*.prof
+
+# Local libraries and imports (never commit personal media)
+/Keeps Library/
+/keeps-dev-library/
+/manifest.json
+/originals/
+/previews/
+/.import.lock
+/.incoming-*/
+
+# Local environment and signing credentials
+.env
+.env.*
+!.env.example
+*.p12
+*.pfx
+*.key
+*.mobileprovision
+*.provisionprofile
+
+# Editor and agent settings
+/.codex/
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# macOS metadata and local logs
+.DS_Store
+._*
+.AppleDouble/
+.LSOverride
+*.log
