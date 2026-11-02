@@ -6,6 +6,7 @@ is stored locally on your Mac.
 
 Keeps is built with Go and [Mygo](https://github.com/egoist/mygo), with Swift
 adapters for macOS media handling and Quick Look.
+
 <img width="2624" height="1824" alt="image" src="https://github.com/user-attachments/assets/a2b9121e-2644-4235-8ce4-320be7eeac03" />
 
 ## Features
