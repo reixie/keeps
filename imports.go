@@ -1,191 +1,180 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"log"
+	"slices"
 	"strings"
+
+	"github.com/egoist/mygo"
 )
 
-// Imports and metadata actions share this queue. A worker publishes its result
-// on the UI thread BEFORE the next job starts, so an older import snapshot can
-// never overwrite a newer Starred result in memory. The store lock protects disk.
-type importInput struct {
-	paths       []string
-	link        *preparedLink
-	cleanup     func()
-	failures    []importFailure
-	starred     *starredOperation
-	trash       *trashOperation
-	purge       bool
-	deleteIDs   []string
-	destination string
-	collections *collectionOperation
-	completed   func(error)
-	// Paste gathers feedback across independent, serialized mutations.
-	finished func(importResult, error)
-}
-type importBatch func() (importInput, error)
-
-func (a *app) addCapture() {
-	if a.collectionDialog != nil || a.linkDialog != nil || a.picking || a.loading || a.store == nil || a.loadError != nil || a.pickMedia == nil {
-		return
-	}
-	a.picking = true
-	returnFocus := a.focus
-	destination := a.activeCollectionID()
-	a.enqueueImport(func() (importInput, error) {
-		paths, err := a.pickMedia()
-		a.update(func() {
-			a.picking = false
-			if a.navigation.hidden && (returnFocus == focusAddCapture || returnFocus == focusNavigation) {
-				a.focus = focusToggle
-			} else if returnFocus != "" {
-				a.focus = returnFocus
-			} else {
-				a.focus = focusLibrary
-			}
-		})
-		return importInput{paths: paths, destination: destination}, err
-	})
+// run performs the mutation off the main thread and returns its UI completion.
+// Staged inputs belong to the queue until run starts, then to the worker.
+type libraryJob struct {
+	run     func(*libraryStore) func()
+	release func()
 }
 
-func (a *app) enqueueImport(batch importBatch) {
-	if a.closed {
-		return
+func (j libraryJob) discard() {
+	if j.release != nil {
+		j.release()
 	}
-	if a.loadError != nil {
-		a.report("Library could not be loaded", a.loadError.Error())
-		return
-	}
-	a.importQueue = append(a.importQueue, batch)
-	a.startNextImport()
 }
 
-func (a *app) startNextImport() {
-	if a.closed || a.importing || a.loading || a.store == nil || len(a.importQueue) == 0 {
+func (a *app) enqueueLibraryJob(job libraryJob) {
+	if a.closed || a.loadError != nil {
+		job.discard()
+		if !a.closed {
+			a.report("Library could not be loaded", a.loadError.Error(), libraryLoadRecovery)
+		}
 		return
 	}
-	batch := a.importQueue[0]
-	a.importQueue = a.importQueue[1:]
-	a.importing = true
+	a.libraryJobs = append(a.libraryJobs, job)
+	a.startNextLibraryJob()
+}
+
+func (a *app) startNextLibraryJob() {
+	if a.closed || a.libraryJobRunning || a.loading || a.store == nil || len(a.libraryJobs) == 0 {
+		return
+	}
+	job := a.libraryJobs[0]
+	a.libraryJobs[0] = libraryJob{}
+	a.libraryJobs = a.libraryJobs[1:]
+	a.libraryJobRunning = true
 	store := a.store
 	go func() {
-		input, err := batch()
-		result := importResult{Failures: input.failures}
-		var purge purgeResult
-		var snapshot manifest
-		if err == nil && input.link != nil {
-			result = store.saveLink(input.link, input.destination)
-			err = result.Fatal
-		} else if err == nil && input.collections != nil {
-			snapshot, err = store.updateCollections(*input.collections)
-		} else if err == nil && input.purge {
-			purge = store.cleanupExpired()
-		} else if err == nil && len(input.deleteIDs) > 0 {
-			purge = store.deletePermanently(input.deleteIDs)
-		} else if err == nil && input.trash != nil {
-			snapshot, err = store.setTrashedSnapshot(input.trash.IDs, input.trash.Restore)
-		} else if err == nil && input.starred != nil {
-			snapshot, err = store.setStarredSnapshot(input.starred.IDs, input.starred.Value)
-		} else if err == nil && len(input.paths) > 0 {
-			result = store.importFiles(input.paths, nil, input.destination)
-			result.Failures = append(input.failures, result.Failures...)
-		}
-		// Inputs belong to the batch until importFiles has closed every source.
-		if input.cleanup != nil {
-			input.cleanup()
-		}
-		a.update(func() {
-			defer func() {
-				a.importing = false
-				a.startNextImport()
-			}()
-			if a.closed {
-				return
+		finish := job.run(store)
+		job.discard()
+		a.window.Update(func() {
+			// A later mutation must not publish ahead of this snapshot.
+			if !a.closed {
+				finish()
 			}
-			if input.collections != nil {
-				if err == nil {
-					a.publishSnapshot(snapshot)
-					a.status = "Collections updated"
-				} else {
-					a.status = "Could not update collections"
-				}
-				if input.completed != nil {
-					input.completed(err)
-				} else if err != nil {
-					a.report(a.status, err.Error())
-				}
-				a.announce(a.status)
-			} else if input.purge || len(input.deleteIDs) > 0 {
-				if input.purge {
-					a.cleanupQueued = false
-				}
-				a.purging = false
-				if purge.Publish {
-					a.publishSnapshot(manifest{Items: purge.Items, Collections: purge.Collections})
-				}
-				if purge.Err != nil {
-					if len(input.deleteIDs) > 0 {
-						a.status = "Could not delete captures permanently"
-						detail := purge.Err.Error()
-						if purge.Publish {
-							a.status = "Deletion could not finish"
-							detail = "Check library permissions. Keeps will retry automatically.\n\n" + detail
-						}
-						a.report(a.status, detail)
-						a.announce(a.status)
-						return
-					}
-					a.status = "Trash cleanup could not finish; Keeps will retry."
-					if detail := purge.Err.Error(); detail != a.cleanupError {
-						a.announce(a.status)
-						a.report("Trash cleanup could not finish", "Keeps will retry. "+detail)
-						log.Printf("Trash cleanup: %s", detail)
-						a.cleanupError = detail
-					}
-				} else {
-					a.cleanupError, a.status = "", ""
-					if len(input.deleteIDs) > 0 {
-						a.status = "Deleted permanently"
-						a.announce(a.status)
-					}
-				}
-			} else if input.trash != nil {
-				if err != nil {
-					a.status = "Could not move captures to Trash"
-					if input.trash.Restore {
-						a.status = "Could not restore captures"
-					}
-					a.report(a.status, err.Error())
-				} else {
-					a.publishSnapshot(snapshot)
-					a.status = "Moved to Trash"
-					if input.trash.Restore {
-						a.status = "Restored"
-					}
-				}
-				a.announce(a.status)
-			} else if input.starred != nil {
-				if err != nil {
-					a.status = "Could not update Starred"
-					a.report(a.status, err.Error())
-				} else {
-					a.publishSnapshot(snapshot)
-					a.status = "Added to Starred"
-					if !input.starred.Value {
-						a.status = "Removed from Starred"
-					}
-				}
-				a.announce(a.status)
-			} else {
-				a.finishCaptureImport(input, result, err)
-			}
+			a.libraryJobRunning = false
+			a.startNextLibraryJob()
 		})
 	}()
 }
 
-// This text contains only failures and actions the user can take. Routine
-// completion counts are announced separately, never placed in a warning.
+func (a *app) discardLibraryJobs() {
+	for _, job := range a.libraryJobs {
+		job.discard()
+	}
+	a.libraryJobs = nil
+}
+
+// The producer owns the input until this main-thread handoff. Mygo drains
+// accepted calls during shutdown and drops calls posted after the loop stops.
+func (a *app) submitPrepared(ctx context.Context, job libraryJob, accept func(libraryJob)) bool {
+	handled, accepted := false, false
+	mygo.RunOnMain(func() {
+		handled = true
+		if a.closed || ctx.Err() != nil {
+			job.discard()
+			return
+		}
+		accept(job)
+		accepted = true
+		a.window.Invalidate()
+	})
+	if !handled {
+		job.discard()
+	}
+	return accepted
+}
+
+func (a *app) addCapture() {
+	if a.closed || a.collectionDialog != nil || a.linkDialog != nil || a.picking || a.loading || a.store == nil || a.loadError != nil {
+		return
+	}
+	a.captureMenu.dismiss()
+	a.picking = true
+	returnFocus := a.focus
+	destination := a.activeCollectionID()
+	a.enqueueLibraryJob(libraryJob{run: func(store *libraryStore) func() {
+		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
+			Parent: a.window, Title: "Add capture", ButtonLabel: "Import", Multiple: true,
+		})
+		a.window.Update(func() {
+			if a.closed {
+				return
+			}
+			a.picking = false
+			a.restoreCaptureFocus(returnFocus)
+		})
+		if err != nil {
+			return func() {
+				const title = "Import could not start"
+				a.report(title, err.Error(), mediaImportRecovery)
+				a.announce(title)
+			}
+		}
+		return a.importMedia(store, paths, destination, a.reportMediaImport)
+	}})
+}
+
+func (a *app) dropFiles(paths []string) {
+	if len(paths) == 0 || a.collectionDialog != nil || a.linkDialog != nil {
+		return
+	}
+	paths = slices.Clone(paths)
+	destination := a.activeCollectionID()
+	a.enqueueLibraryJob(libraryJob{run: func(store *libraryStore) func() {
+		return a.importMedia(store, paths, destination, a.reportMediaImport)
+	}})
+}
+
+func (a *app) importMedia(store *libraryStore, paths []string, destination string, finish func(importResult)) func() {
+	result := store.importFiles(paths, destination)
+	return func() {
+		if len(paths) > 0 && result.Fatal == nil {
+			a.publishSnapshot(manifest{Items: result.Items, Collections: result.Collections})
+		}
+		if result.Added > 0 {
+			if destination == "" {
+				a.navigation.selected = sectionLibrary
+				a.grid.scroll.Y = 0
+			} else if a.activeCollectionID() == destination {
+				a.grid.scroll.Y = 0
+			}
+		}
+		if len(paths) > 0 {
+			finish(result)
+		}
+	}
+}
+
+func (a *app) linkJob(prepared *preparedLink, destination string, finish func(importResult)) libraryJob {
+	return libraryJob{release: prepared.cleanup, run: func(store *libraryStore) func() {
+		result := store.saveLink(prepared, destination)
+		return func() {
+			if result.Fatal == nil {
+				a.publishSnapshot(manifest{Items: result.Items, Collections: result.Collections})
+			}
+			finish(result)
+		}
+	}}
+}
+
+const mediaImportRecovery = "Try Add capture again with readable image or video files."
+
+func (a *app) reportMediaImport(result importResult) {
+	a.announce(fmt.Sprintf("%d added, %d already saved, %d failed", result.Added, result.Duplicates, len(result.Failures)))
+	a.reportImportWarnings(result)
+}
+
+func (a *app) reportImportWarnings(result importResult) {
+	if detail := importWarningDetail(result); detail != "" {
+		title, recovery := "Import needs attention", ""
+		if len(result.Failures) > 0 || result.Fatal != nil {
+			title, recovery = "Some files could not be imported", mediaImportRecovery
+		}
+		a.report(title, detail, recovery)
+		a.announce(detail)
+	}
+}
+
 func importWarningDetail(result importResult) string {
 	var lines []string
 	for _, failure := range result.Failures {
@@ -201,66 +190,4 @@ func importWarningDetail(result importResult) string {
 		lines = append(lines, "The destination collection no longer exists; captures remain in Library. Choose another collection to assign them.")
 	}
 	return strings.Join(lines, "\n\n")
-}
-
-func (a *app) finishCaptureImport(input importInput, result importResult, err error) {
-	if err == nil && result.Fatal == nil && (input.link != nil || len(input.paths) > 0) {
-		a.publishSnapshot(manifest{Items: result.Items, Collections: result.Collections})
-	}
-	if result.Added > 0 && len(input.paths) > 0 {
-		if input.destination == "" {
-			a.navigation.selected = sectionLibrary
-			a.libraryScroll.Y = 0
-		} else if a.activeCollectionID() == input.destination {
-			a.libraryScroll.Y = 0
-		}
-	}
-	if input.finished != nil {
-		// The callback observes the committed snapshot before any next job.
-		input.finished(result, err)
-		return
-	}
-	if input.link != nil {
-		a.status = linkSavedStatus(result, input.link)
-		if err != nil {
-			a.status = "Could not save link"
-		}
-		if input.completed != nil {
-			input.completed(err) // Add Link keeps save errors inline.
-		} else if err != nil {
-			a.report(a.status, err.Error())
-		}
-		a.announce(a.status)
-		if err != nil {
-			return
-		}
-	} else if err != nil {
-		a.status = "Import could not start"
-		a.report(a.status, err.Error())
-		a.announce(a.status)
-		return
-	} else if len(input.paths) > 0 {
-		a.status = fmt.Sprintf("%d added, %d already saved, %d failed", result.Added, result.Duplicates, len(result.Failures))
-		a.announce(a.status)
-	}
-	if detail := importWarningDetail(result); detail != "" {
-		title := "Import needs attention"
-		if len(result.Failures) > 0 || result.Fatal != nil {
-			title = "Some files could not be imported"
-		}
-		a.report(title, detail)
-		a.announce(detail)
-	}
-}
-
-func (a *app) dropFiles(paths []string) {
-	if a.collectionDialog != nil || a.linkDialog != nil {
-		return
-	}
-	frozen := append([]string(nil), paths...)
-	if len(frozen) == 0 {
-		return
-	}
-	destination := a.activeCollectionID()
-	a.enqueueImport(func() (importInput, error) { return importInput{paths: frozen, destination: destination}, nil })
 }

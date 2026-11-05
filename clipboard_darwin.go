@@ -14,7 +14,7 @@ import (
 var captureClipboardFormats = []transfer.Format{transfer.FileList, transfer.URIList, transfer.PNG, transfer.Text}
 
 // Called only by the Paste handler on Mygo's main thread. Normally Mygo does
-// all native snapshotting. Its 0.6.4 reader aborts the whole transfer on one
+// all native snapshotting. Its reader aborts the whole transfer on one
 // oversized representation or failed TIFF conversion; that case needs a
 // per-item snapshot so unrelated files/links can still be saved.
 func readCaptureClipboard() (transfer.Data, error) {

@@ -72,6 +72,12 @@ func newThumbnailCache(store *libraryStore, update func(func())) *thumbnailCache
 	return c
 }
 
+func (c *thumbnailCache) close() {
+	if c != nil {
+		close(c.stop)
+	}
+}
+
 func (c *thumbnailCache) get(item capture) *thumbnailEntry {
 	c.clock++
 	if e := c.entries[item.ID]; e != nil {
@@ -186,7 +192,7 @@ func loadThumbnail(store *libraryStore, item capture) (*ui.Bitmap, error) {
 	stage := f.Name()
 	f.Close()
 	defer os.Remove(stage)
-	if _, err := store.preview(filepath.Join(store.root, item.Original), stage); err != nil {
+	if _, err := nativePreview(filepath.Join(store.root, item.Original), stage); err != nil {
 		return nil, err
 	}
 	unlock, err = store.lockRetainedThumbnail(item)

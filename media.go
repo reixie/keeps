@@ -8,10 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
-
-	"github.com/egoist/mygo"
 )
 
 type mediaInfo struct {
@@ -21,18 +20,22 @@ type mediaInfo struct {
 	Height int    `json:"height"`
 }
 
-type mediaAdapter func(original, preview string) (mediaInfo, error)
-
 var nativeMediaSlots = make(chan struct{}, 2)
 
-func nativeHelper() string {
-	dir, _ := mygo.App.Path(mygo.PathResources)
-	path := filepath.Join(dir, "KeepsMedia")
-	if _, err := os.Stat(path); err == nil {
-		return path
+func nativeMediaCommand(ctx context.Context, args ...string) (*exec.Cmd, error) {
+	path, err := nativeResource("KeepsMedia")
+	if err != nil {
+		return nil, err
 	}
-	// Direct development runs use resources without platform merging.
-	return filepath.Join(dir, "darwin-"+hostArch(), "KeepsMedia")
+	return exec.CommandContext(ctx, path, args...), nil
+}
+
+func nativeMediaOutput(ctx context.Context, args ...string) ([]byte, error) {
+	cmd, err := nativeMediaCommand(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	return cmd.Output()
 }
 
 func nativePreview(original, preview string) (mediaInfo, error) {
@@ -40,7 +43,10 @@ func nativePreview(original, preview string) (mediaInfo, error) {
 	defer func() { <-nativeMediaSlots }()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, nativeHelper(), original, preview)
+	cmd, err := nativeMediaCommand(ctx, original, preview)
+	if err != nil {
+		return mediaInfo{}, err
+	}
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	data, err := cmd.Output()
@@ -74,7 +80,7 @@ func defaultLibraryRoot() (string, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, nativeHelper(), "--documents").Output()
+	out, err := nativeMediaOutput(ctx, "--documents")
 	if err != nil {
 		return "", fmt.Errorf("locate system Documents folder: %w", err)
 	}
@@ -97,8 +103,65 @@ func originalPNG(path string) ([]byte, error) {
 	output := filepath.Join(dir, "image.png")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := exec.CommandContext(ctx, nativeHelper(), "--raster", path, output).Run(); err != nil {
+	cmd, err := nativeMediaCommand(ctx, "--raster", path, output)
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("could not prepare original image for clipboard: %w", err)
 	}
 	return os.ReadFile(output)
+}
+
+func runLinkMediaCommand(ctx context.Context, args ...string) ([]byte, error) {
+	select {
+	case nativeMediaSlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-nativeMediaSlots }()
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	out, err := nativeMediaOutput(ctx, args...)
+	if err != nil {
+		return nil, fmt.Errorf("Could not prepare local link images: %w", err)
+	}
+	return out, nil
+}
+
+func nativeLinkImage(ctx context.Context, input, output string, edge int) (mediaInfo, error) {
+	out, err := runLinkMediaCommand(ctx, "--link-image", input, output, strconv.Itoa(edge))
+	if err != nil {
+		return mediaInfo{}, err
+	}
+	var info mediaInfo
+	if err := json.Unmarshal(out, &info); err != nil {
+		return mediaInfo{}, err
+	}
+	if info.Width <= 0 || info.Height <= 0 {
+		return mediaInfo{}, fmt.Errorf("invalid link image dimensions")
+	}
+	return info, nil
+}
+
+func nativeLinkPlaceholder(ctx context.Context, output string) error {
+	_, err := runLinkMediaCommand(ctx, "--link-placeholder", output)
+	return err
+}
+
+// Matches LinkComposition in the KeepsMedia helper.
+type linkComposition struct {
+	Favicon string `json:"favicon"`
+	Image   string `json:"image"`
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+}
+
+func nativeLinkCompose(ctx context.Context, specPath, output string, spec linkComposition) error {
+	data, _ := json.Marshal(spec)
+	if err := os.WriteFile(specPath, data, 0600); err != nil {
+		return err
+	}
+	_, err := runLinkMediaCommand(ctx, "--link-compose", specPath, output)
+	return err
 }

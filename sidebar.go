@@ -25,7 +25,7 @@ type navigationState struct {
 }
 
 func newApp() *app {
-	return &app{navigation: navigationState{selected: sectionLibrary}, focus: focusLibrary, selection: captureSelection{}}
+	return &app{navigation: navigationState{selected: sectionLibrary}, focus: focusLibrary}
 }
 
 //go:embed resources/sidebar/*.svg
@@ -86,7 +86,7 @@ func (a *app) sidebar(c *ui.Context, t themeValues) {
 			})
 			for _, entry := range a.collections {
 				id := collectionSection(entry.ID)
-				a.sidebarRow(c, t, base, id, entry.Name, collectionIcon(entry.Icon), a.sectionCount(id), &entry)
+				a.sidebarRow(c, t, base, id, entry.Name, collectionIconFor(entry.Icon).icon, a.sectionCount(id), &entry)
 			}
 		}).Grow(1).MinHeight(0).Shrink(1).Padding(8, 12).Gap(4).
 			Background(ui.Transparent).Label("Navigation").FocusBind(&a.focus, focusNavigation).
@@ -176,11 +176,11 @@ func (a *app) sidebarRow(c *ui.Context, t themeValues, base *ui.Theme, id, label
 }
 
 func (a *app) sidebarAddCapture(c *ui.Context, t themeValues, x float32) {
-	b := ui.ButtonBase(c).Key("add-capture").Absolute().Left(x).Top(12).
-		Size(32, 32).Padding(8).Radius(100).Role(ui.RoleButton).
+	b := ui.ButtonBase(c).Key("add-capture").Absolute().Left(x).Top(sidebarControlTop).
+		Size(sidebarControlSize, sidebarControlSize).Padding(8).Radius(100).Role(ui.RoleButton).
 		Label("Add capture").Tooltip("Add capture").
 		FocusBind(&a.focus, focusAddCapture).
-		Disabled(a.loading || a.picking || a.loadError != nil).HandleInput(a.shellInput)
+		Disabled(a.captureMenu == nil || a.loading || a.picking || a.loadError != nil).HandleInput(a.shellInput)
 	ink := t.TextSecondary
 	if b.Hovered() {
 		ink = t.TextPrimary
@@ -195,13 +195,29 @@ func (a *app) sidebarAddCapture(c *ui.Context, t themeValues, x float32) {
 	b.Children(func() {
 		ui.Icon(c, addCaptureIcon).Size(16, 16).TextColor(ink)
 	})
-	b.Menu(func(m *ui.Menu) {
-		if m.Item("Media…").Chosen() {
-			a.addCapture()
+	bounds := b.Bounds()
+	b.OnClick(func() {
+		a.window.Update(func() {
+			if a.navigation.hidden || a.loading || a.loadError != nil || a.libraryInputBlocked() {
+				return
+			}
+			a.focus = focusAddCapture
+			a.captureMenu.show(bounds)
+		})
+	})
+}
+
+func (a *app) captureMenuClosed(result int32) {
+	a.window.Update(func() {
+		if a.navigation.hidden || a.libraryInputBlocked() {
 			return
 		}
-		if m.Item("Link…").Chosen() {
+		a.focus = focusAddCapture
+		switch result {
+		case captureMenuLink:
 			a.addLink()
+		case captureMenuMedia:
+			a.addCapture()
 		}
 	})
 }
@@ -215,8 +231,8 @@ func captureNoun(n int) string {
 
 func (a *app) sidebarToggle(c *ui.Context, t themeValues, x float32) {
 	label := a.sidebarActionLabel()
-	b := ui.ButtonBase(c).Key("sidebar-toggle").Absolute().Left(x).Top(12).
-		Size(32, 32).Padding(8).Radius(100).Role(ui.RoleButton).
+	b := ui.ButtonBase(c).Key("sidebar-toggle").Absolute().Left(x).Top(sidebarControlTop).
+		Size(sidebarControlSize, sidebarControlSize).Padding(8).Radius(100).Role(ui.RoleButton).
 		Label(label).Tooltip(label+" (⌃⌘S)").FocusBind(&a.focus, focusToggle).HandleInput(a.shellInput)
 	ink := t.TextSecondary
 	if b.Hovered() {
@@ -244,13 +260,14 @@ func (a *app) setSidebarHidden(hidden bool) {
 	a.navigation.hidden = hidden
 	a.focus = focusNavigation
 	if hidden {
+		a.captureMenu.dismiss()
 		a.focus = focusToggle
 	}
 	if a.sidebarMenu != nil {
 		a.sidebarMenu.SetLabel(a.sidebarActionLabel())
 	}
-	if a.invalidate != nil {
-		a.invalidate()
+	if a.window != nil {
+		a.window.Invalidate()
 	}
 }
 

@@ -181,6 +181,11 @@ private final class InlinePlayer: @unchecked Sendable {
 
 private enum PlaybackError: Error { case noVideo }
 
+// Values match inlineFrameStatus in the Go adapter.
+private enum PlaybackFrameResult: Int32 {
+    case still = -2, failed = -1, unchanged = 0, ready = 1
+}
+
 private struct PreviewRecord: Decodable, Equatable {
     let id: String
     let path: String
@@ -427,23 +432,23 @@ public func playbackRemove(_ pointer: UnsafeRawPointer, _ id: UnsafePointer<CCha
 public func playbackFrame(_ pointer: UnsafeRawPointer, _ id: UnsafePointer<CChar>, _ pixels: UnsafeMutableRawPointer, _ width: Int32, _ height: Int32) -> Int32 {
     let owner = session(pointer)
     if let entry = owner.gifs[String(cString: id)] {
-        guard owner.canPlay, !entry.stopped else { return 0 }
-        if entry.still { return -2 }
-        if entry.failed { return -1 }
+        guard owner.canPlay, !entry.stopped else { return PlaybackFrameResult.unchanged.rawValue }
+        if entry.still { return PlaybackFrameResult.still.rawValue }
+        if entry.failed { return PlaybackFrameResult.failed.rawValue }
         entry.update()
-        guard entry.delivered != entry.frames, let image = entry.image else { return 0 }
+        guard entry.delivered != entry.frames, let image = entry.image else { return PlaybackFrameResult.unchanged.rawValue }
         guard let context = CGContext(data: pixels, width: Int(width), height: Int(height), bitsPerComponent: 8, bytesPerRow: Int(width)*4,
-                                      space: owner.colorSpace, bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue) else { return -1 }
+                                      space: owner.colorSpace, bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue) else { return PlaybackFrameResult.failed.rawValue }
         context.interpolationQuality = .high
         context.setBlendMode(.copy)
         context.draw(image, in: CGRect(x: 0, y: 0, width: Int(width), height: Int(height)))
         entry.presented()
-        return 1
+        return PlaybackFrameResult.ready.rawValue
     }
-    guard owner.canPlay, let entry = owner.players[String(cString: id)], !entry.stopped else { return 0 }
-    guard !entry.failed, entry.player.status != .failed, entry.player.currentItem?.status != .failed else { return -1 }
+    guard owner.canPlay, let entry = owner.players[String(cString: id)], !entry.stopped else { return PlaybackFrameResult.unchanged.rawValue }
+    guard !entry.failed, entry.player.status != .failed, entry.player.currentItem?.status != .failed else { return PlaybackFrameResult.failed.rawValue }
     let time = entry.output.itemTime(forHostTime: CACurrentMediaTime())
-    guard entry.output.hasNewPixelBuffer(forItemTime: time), let buffer = entry.output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) else { return 0 }
+    guard entry.output.hasNewPixelBuffer(forItemTime: time), let buffer = entry.output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) else { return PlaybackFrameResult.unchanged.rawValue }
     return autoreleasepool {
         var image = CIImage(cvPixelBuffer: buffer)
         // Track transforms use top-left video coordinates. Conjugate through
@@ -456,7 +461,7 @@ public func playbackFrame(_ pointer: UnsafeRawPointer, _ id: UnsafePointer<CChar
         // CIContext's bitmap export supplies the row order Mygo expects.
         owner.context.render(image, toBitmap: pixels, rowBytes: Int(width) * 4,
                              bounds: CGRect(x: 0, y: 0, width: Int(width), height: Int(height)), format: .RGBA8, colorSpace: owner.colorSpace)
-        return 1
+        return PlaybackFrameResult.ready.rawValue
     }
 }
 
@@ -465,12 +470,4 @@ public func previewUpdate(_ pointer: UnsafeRawPointer, _ json: UnsafePointer<CCh
     let owner = session(pointer)
     guard let records = try? JSONDecoder().decode([PreviewRecord].self, from: Data(String(cString: json).utf8)) else { return }
     owner.setSequence(records, target: String(cString: target))
-}
-
-@_cdecl("KeepsPreviewCurrent")
-public func previewCurrent(_ pointer: UnsafeRawPointer, _ output: UnsafeMutablePointer<UInt8>, _ capacity: Int32) -> Int32 {
-    let data = Array(session(pointer).currentID.utf8)
-    guard data.count < capacity else { return 0 }
-    for (index, value) in data.enumerated() { output[index] = value }
-    return Int32(data.count)
 }

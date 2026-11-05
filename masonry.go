@@ -12,9 +12,8 @@ const (
 
 type cardRect struct{ X, Y, W, H float32 }
 type masonryLayout struct {
-	Cards   []cardRect
-	Height  float32
-	Columns int
+	Cards  []cardRect
+	Height float32
 }
 
 func layoutMasonry(items []capture, width float32) masonryLayout {
@@ -25,7 +24,7 @@ func layoutMasonry(items []capture, width float32) masonryLayout {
 	for i := range bottom {
 		bottom[i] = masonryPadding
 	}
-	layout := masonryLayout{Cards: make([]cardRect, len(items)), Columns: n, Height: 2 * masonryPadding}
+	layout := masonryLayout{Cards: make([]cardRect, len(items)), Height: 2 * masonryPadding}
 	for i, item := range items {
 		col := 0
 		for j := 1; j < n; j++ {

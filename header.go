@@ -25,16 +25,16 @@ var headerGridIcon = headerIcon("grid")
 
 func (a *app) sidebarToggleX(c *ui.Context) float32 {
 	if a.navigation.hidden {
-		return max(96, c.TitleBar().Left+12)
+		return max(96, c.TitleBar().Left+sidebarControlInset)
 	}
-	return sidebarWidth - 12 - 32
+	return sidebarWidth - sidebarControlInset - sidebarControlSize
 }
 
 func (a *app) sectionHeading() (string, *ui.SVG) {
 	if id := a.activeCollectionID(); id != "" {
 		for _, entry := range a.collections {
 			if entry.ID == id {
-				return entry.Name, collectionIcon(entry.Icon)
+				return entry.Name, collectionIconFor(entry.Icon).icon
 			}
 		}
 	}
@@ -52,7 +52,7 @@ func (a *app) header(c *ui.Context, t themeValues) {
 	if a.navigation.hidden {
 		// The panel begins after the outer padding and its one-point border.
 		// Leave a normal Header inset after the native/sidebar control group.
-		left = max(left, a.sidebarToggleX(c)+32+headerPadding-contentPadding-1)
+		left = max(left, a.sidebarToggleX(c)+sidebarControlSize+headerPadding-contentPadding-panelBorderWidth)
 	}
 	ui.Row(c).Key("header").Height(headerHeight).Shrink(0).
 		Padding(0, headerPadding, 0, left).AlignItems(ui.Center).Gap(16).

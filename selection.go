@@ -6,21 +6,69 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-const focusLibrary = "library-panel"
+const (
+	focusLibrary       = "library-panel"
+	captureFocusPrefix = "capture:"
+)
 
-type captureSelection map[string]bool
+type captureSelection struct {
+	members map[string]struct{}
+	order   []string
+}
 
-func (s captureSelection) click(id string, toggle bool) {
-	if toggle {
-		if s[id] {
-			delete(s, id)
-		} else {
-			s[id] = true
-		}
+func (s *captureSelection) has(id string) bool {
+	_, ok := s.members[id]
+	return ok
+}
+
+func (s *captureSelection) add(id string) {
+	if s.members == nil {
+		s.members = make(map[string]struct{})
+	}
+	s.members[id] = struct{}{}
+	s.order = append(s.order, id)
+}
+
+func (s *captureSelection) clear() {
+	clear(s.members)
+	s.order = nil
+}
+
+func (s *captureSelection) click(id string, toggle bool) {
+	if !toggle {
+		s.clear()
+	}
+	if s.has(id) {
+		delete(s.members, id)
+		s.order = slices.DeleteFunc(s.order, func(old string) bool { return old == id })
 		return
 	}
-	clear(s)
-	s[id] = true
+	s.add(id)
+}
+
+func (s *captureSelection) retain(visible map[string]bool) {
+	s.order = slices.DeleteFunc(s.order, func(id string) bool {
+		if visible[id] {
+			return false
+		}
+		delete(s.members, id)
+		return true
+	})
+}
+
+func (a *app) restoreCaptureFocus(previous string) {
+	switch {
+	case a.navigation.hidden && (previous == focusAddCapture || previous == focusNavigation):
+		a.focus = focusToggle
+	case previous == "":
+		a.focus = focusLibrary
+	default:
+		a.focus = previous
+	}
+}
+
+func (a *app) libraryInputBlocked() bool {
+	return a.closed || a.picking || a.nativeDialogs > 0 || a.collectionDialog != nil || a.linkDialog != nil || a.previewOwnsFocus()
 }
 
 // Focused text widgets handle their own InputCommand. These handlers are
@@ -28,7 +76,7 @@ func (s captureSelection) click(id string, toggle bool) {
 func (a *app) shellInput(ev ui.InputEvent) bool { return a.libraryInput(ev, false) }
 
 func (a *app) libraryInput(ev ui.InputEvent, libraryContext bool) bool {
-	if a.clipboardBlocked() {
+	if a.libraryInputBlocked() {
 		return false
 	}
 	command := ""
@@ -47,8 +95,7 @@ func (a *app) libraryInput(ev ui.InputEvent, libraryContext bool) bool {
 			}
 		}
 		if ev.Mods == 0 && ev.Key == ui.KeyEscape {
-			clear(a.selection)
-			a.selectionOrder = nil
+			a.selection.clear()
 			return true
 		}
 		if libraryContext && ev.Mods == 0 && (ev.Key == ui.KeySpace || ev.Key == ui.KeyEnter) {
@@ -73,36 +120,22 @@ func (a *app) libraryInput(ev ui.InputEvent, libraryContext bool) bool {
 		if !a.captureSection() || !libraryContext {
 			return false
 		}
-		clear(a.selection)
-		a.selectionOrder = nil
+		a.selection.clear()
 		for _, item := range a.visibleItems() {
-			a.selection[item.ID] = true
-			a.selectionOrder = append(a.selectionOrder, item.ID)
+			a.selection.add(item.ID)
 		}
 		return true
 	}
 	return false
 }
 
-// Keep the order of explicit selections for URL clipboard items. All-media
-// copies retain their existing visible-library order.
-func (a *app) selectCapture(id string, toggle bool) {
-	if !toggle {
-		a.selectionOrder = nil
-	}
-	a.selection.click(id, toggle)
-	if a.selection[id] && !slices.Contains(a.selectionOrder, id) {
-		a.selectionOrder = append(a.selectionOrder, id)
-	}
-	if !a.selection[id] {
-		a.selectionOrder = slices.DeleteFunc(a.selectionOrder, func(old string) bool { return old == id })
-	}
-}
-func (a *app) orderedCopySelection() []capture {
+// Mixed and URL clipboard items use the order of explicit selections.
+// All-media copies follow the visible library order.
+func (s *captureSelection) orderedCopy(items []capture) []capture {
 	var selected []capture
 	hasLink := false
-	for _, item := range a.visibleItems() {
-		if a.selection[item.ID] {
+	for _, item := range items {
+		if s.has(item.ID) {
 			selected = append(selected, item)
 			hasLink = hasLink || item.isLink()
 		}
@@ -115,14 +148,8 @@ func (a *app) orderedCopySelection() []capture {
 		byID[item.ID] = item
 	}
 	ordered := make([]capture, 0, len(selected))
-	for _, id := range a.selectionOrder {
+	for _, id := range s.order {
 		if item, ok := byID[id]; ok {
-			ordered = append(ordered, item)
-			delete(byID, id)
-		}
-	}
-	for _, item := range selected {
-		if _, ok := byID[item.ID]; ok {
 			ordered = append(ordered, item)
 		}
 	}

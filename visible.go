@@ -3,7 +3,17 @@ package main
 import (
 	"slices"
 	"strings"
+
+	"github.com/egoist/mygo/ui"
 )
+
+type captureGrid struct {
+	scroll      ui.ScrollState
+	layout      masonryLayout
+	layoutWidth float32
+	layoutItems []capture
+	revealFocus bool
+}
 
 func (a *app) captureSection() bool {
 	return a.navigation.selected == sectionLibrary || a.navigation.selected == sectionStarred || a.navigation.selected == sectionTrash || a.activeCollectionID() != ""
@@ -54,54 +64,70 @@ func (a *app) sectionCount(section string) int {
 	return count
 }
 
-func sameLayoutItems(a, b []capture) bool {
-	return slices.EqualFunc(a, b, func(a, b capture) bool {
-		return a.ID == b.ID && a.Kind == b.Kind && a.Width == b.Width && a.Height == b.Height
-	})
-}
-
 // Prune hidden IDs and repair focus at the closest surviving neighbor in the
 // former visible order (prefer the next card on a tie).
-// The following layout pass clamps the scroll offset to the new content height.
 func (a *app) reconcileVisible(items []capture) {
 	visible := make(map[string]bool, len(items))
 	for _, item := range items {
 		visible[item.ID] = true
 	}
-	for id := range a.selection {
-		if !visible[id] {
-			delete(a.selection, id)
-		}
-	}
-	a.selectionOrder = slices.DeleteFunc(a.selectionOrder, func(id string) bool { return !a.selection[id] })
-	if id, card := strings.CutPrefix(a.focus, "capture:"); card && !visible[id] {
-		index := slices.IndexFunc(a.layoutItems, func(item capture) bool { return item.ID == id })
+	a.selection.retain(visible)
+	if id, card := strings.CutPrefix(a.focus, captureFocusPrefix); card && !visible[id] {
 		a.focus = focusLibrary
 		if len(items) > 0 {
-			next := items[0].ID
-			if index >= 0 {
-			search:
-				for distance := 1; distance < len(a.layoutItems); distance++ {
-					for _, i := range []int{index + distance, index - distance} {
-						if i >= 0 && i < len(a.layoutItems) && visible[a.layoutItems[i].ID] {
-							next = a.layoutItems[i].ID
-							break search
-						}
-					}
-				}
+			next := a.grid.neighbor(id, visible)
+			if next == "" {
+				next = items[0].ID
 			}
-			a.focus = "capture:" + next
-			a.focusNeedsReveal = true
+			a.focus = captureFocusPrefix + next
+			a.grid.revealFocus = true
 		}
 	}
 }
 
-func (a *app) revealCard(index int, viewportHeight float32) {
-	r := a.layout.Cards[index]
-	if r.Y < a.libraryScroll.Y {
-		a.libraryScroll.Y = r.Y
+func (g *captureGrid) neighbor(id string, visible map[string]bool) string {
+	index := slices.IndexFunc(g.layoutItems, func(item capture) bool { return item.ID == id })
+	if index < 0 {
+		return ""
 	}
-	if r.Y+r.H > a.libraryScroll.Y+viewportHeight {
-		a.libraryScroll.Y = max(r.Y, r.Y+r.H-viewportHeight)
+	for distance := 1; distance < len(g.layoutItems); distance++ {
+		for _, i := range []int{index + distance, index - distance} {
+			if i >= 0 && i < len(g.layoutItems) && visible[g.layoutItems[i].ID] {
+				return g.layoutItems[i].ID
+			}
+		}
+	}
+	return ""
+}
+
+func (g *captureGrid) reset() {
+	g.scroll.Y = 0
+	g.revealFocus = false
+	g.layout, g.layoutItems = masonryLayout{}, nil
+}
+
+func (g *captureGrid) updateLayout(items []capture, width, viewportHeight float32, focus string) {
+	if g.layoutWidth != width || !slices.EqualFunc(g.layoutItems, items, func(a, b capture) bool {
+		return a.ID == b.ID && a.Kind == b.Kind && a.Width == b.Width && a.Height == b.Height
+	}) {
+		g.layout = layoutMasonry(items, width)
+		g.layoutWidth, g.layoutItems = width, slices.Clone(items)
+	}
+	g.scroll.Y = min(g.scroll.Y, max(0, g.layout.Height-viewportHeight))
+	if g.revealFocus {
+		if index := slices.IndexFunc(items, func(item capture) bool { return focus == captureFocusPrefix+item.ID }); index >= 0 {
+			g.revealCard(index, viewportHeight)
+		}
+		g.revealFocus = false
+	}
+}
+
+func (g *captureGrid) revealCard(index int, viewportHeight float32) {
+	r := g.layout.Cards[index]
+	if r.Y < g.scroll.Y {
+		g.scroll.Y = r.Y
+	}
+	if r.Y+r.H > g.scroll.Y+viewportHeight {
+		g.scroll.Y = max(r.Y, r.Y+r.H-viewportHeight)
 	}
 }

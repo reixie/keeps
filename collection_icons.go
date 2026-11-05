@@ -6,51 +6,47 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-//go:embed resources/collections/*.svg
+//go:embed resources/collections/reicon/*.svg
 var collectionAssets embed.FS
 
-func collectionAsset(key string) *ui.SVG {
-	data, err := collectionAssets.ReadFile("resources/collections/" + key + ".svg")
+type collectionIconEntry struct {
+	key, label string
+	icon       *ui.SVG
+}
+
+func loadCollectionIcon(key, label string) collectionIconEntry {
+	data, err := collectionAssets.ReadFile("resources/collections/reicon/" + key + ".svg")
 	if err != nil {
 		panic(err)
 	}
-	return ui.MustParseSVG(data)
+	return collectionIconEntry{key: key, label: label, icon: ui.MustParseSVG(data)}
 }
 
-var collectionIcons = []struct {
-	key, label string
-	icon       *ui.SVG
-}{
-	{"folder", "Folder", collectionAsset("folder")},
-	{"archive", "Archive", collectionAsset("archive")},
-	{"image", "Image", collectionAsset("image")},
-	{"video", "Video", collectionAsset("video")},
-	{"book", "Book", collectionAsset("book")},
-	{"globe", "Globe", collectionAsset("globe")},
-	{"camera", "Camera", collectionAsset("camera")},
-	{"palette", "Palette", collectionAsset("palette")},
-	{"lightbulb", "Lightbulb", collectionAsset("lightbulb")},
-	{"heart", "Heart", collectionAsset("heart")},
-	{"star", "Star", collectionAsset("star")},
-	{"bookmark", "Bookmark", collectionAsset("bookmark")},
+var collectionIcons = []collectionIconEntry{
+	loadCollectionIcon("folder", "Folder"),
+	loadCollectionIcon("archive", "Archive"),
+	loadCollectionIcon("image", "Image"),
+	loadCollectionIcon("video", "Video"),
+	loadCollectionIcon("book", "Book"),
+	loadCollectionIcon("globe", "Globe"),
+	loadCollectionIcon("camera", "Camera"),
+	loadCollectionIcon("palette", "Palette"),
+	loadCollectionIcon("lightbulb", "Lightbulb"),
+	loadCollectionIcon("heart", "Heart"),
+	loadCollectionIcon("star", "Star"),
+	loadCollectionIcon("bookmark", "Bookmark"),
 }
 
-var collectionPlusIcon = collectionAsset("plus")
+//go:embed resources/collections/plus.svg
+var collectionPlusSVG []byte
 
-func collectionIcon(key string) *ui.SVG {
+var collectionPlusIcon = ui.MustParseSVG(collectionPlusSVG)
+
+func collectionIconFor(key string) collectionIconEntry {
 	for _, item := range collectionIcons {
 		if item.key == key {
-			return item.icon
+			return item
 		}
 	}
-	return collectionIcons[0].icon
-}
-
-func collectionIconLabel(key string) string {
-	for _, item := range collectionIcons {
-		if item.key == key {
-			return item.label
-		}
-	}
-	return "Folder"
+	return collectionIcons[0]
 }

@@ -3,10 +3,13 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
 	"time"
+
+	"github.com/egoist/mygo"
 )
 
 const trashRetention = 30 * 24 * time.Hour
@@ -31,49 +34,20 @@ func (op trashOperation) label() string {
 	return "Move to Trash"
 }
 
-// One atomic metadata update, retaining all media and original ordering.
-func (s *libraryStore) setTrashed(ids []string, restore bool) ([]capture, error) {
-	m, err := s.setTrashedSnapshot(ids, restore)
-	return m.Items, err
-}
-
 func (s *libraryStore) setTrashedSnapshot(ids []string, restore bool) (manifest, error) {
 	if len(ids) == 0 {
 		return manifest{}, fmt.Errorf("no captures targeted")
 	}
-	unlock, err := s.lockMetadata()
-	if err != nil {
-		return manifest{}, err
-	}
-	defer unlock()
-	m, err := s.readManifest()
-	if err != nil {
-		return manifest{}, err
-	}
-	targets := make(map[string]bool, len(ids))
-	for _, id := range ids {
-		targets[id] = true
-	}
-	now := s.now().UTC()
-	for i := range m.Items {
-		item := &m.Items[i]
-		if !targets[item.ID] {
-			continue
-		}
-		if restore {
-			item.TrashedAt = nil
-		} else if item.TrashedAt == nil {
-			item.TrashedAt = &now
-		}
-		delete(targets, item.ID)
-	}
-	if len(targets) != 0 {
-		return manifest{}, fmt.Errorf("targeted capture no longer exists")
-	}
-	if err := s.writeManifest(m); err != nil {
-		return manifest{}, err
-	}
-	return m, nil
+	return s.editManifest(func(m *manifest) error {
+		now := time.Now().UTC()
+		return editCaptureTargets(m.Items, ids, func(item *capture) {
+			if restore {
+				item.TrashedAt = nil
+			} else if item.TrashedAt == nil {
+				item.TrashedAt = &now
+			}
+		})
+	})
 }
 
 type purgeResult struct {
@@ -86,20 +60,20 @@ type purgeResult struct {
 // cleanupExpired is called only by the serial mutation worker. The same flock
 // also protects against separate store instances and processes. No IDs or clock
 // readings are captured at enqueue time: a committed Restore always wins.
-func (s *libraryStore) cleanupExpired() purgeResult {
-	return s.purgeCaptures(nil)
+func (s *libraryStore) cleanupExpired(beforeUnlink func(manifest) error) purgeResult {
+	return s.purgeCaptures(nil, beforeUnlink)
 }
 
-func (s *libraryStore) deletePermanently(ids []string) purgeResult {
+func (s *libraryStore) deletePermanently(ids []string, beforeUnlink func(manifest) error) purgeResult {
 	if len(ids) == 0 {
 		return purgeResult{Err: fmt.Errorf("no captures targeted")}
 	}
-	return s.purgeCaptures(ids)
+	return s.purgeCaptures(ids, beforeUnlink)
 }
 
 // Explicit targets bypass retention, but must ALL still be in Trash when the
 // lock is acquired. Both deletion paths share durable intent and recovery.
-func (s *libraryStore) purgeCaptures(ids []string) (result purgeResult) {
+func (s *libraryStore) purgeCaptures(ids []string, beforeUnlink func(manifest) error) (result purgeResult) {
 	if _, err := os.Stat(s.root); errors.Is(err, os.ErrNotExist) {
 		if len(ids) > 0 {
 			result.Err = err
@@ -137,7 +111,7 @@ func (s *libraryStore) purgeCaptures(ids []string) (result purgeResult) {
 			return
 		}
 	}
-	now := s.now().UTC()
+	now := time.Now().UTC()
 	var retained []capture
 	marked := false
 	for _, item := range m.Items {
@@ -165,10 +139,9 @@ func (s *libraryStore) purgeCaptures(ids []string) (result purgeResult) {
 		result.Err = err
 		return
 	}
-	if s.beforePurgeSnapshot != nil {
-		s.beforePurgeSnapshot(m)
-	} else if s.beforePurge != nil {
-		s.beforePurge(m.Items)
+	if err := beforeUnlink(m); err != nil {
+		result.Err = err
+		return
 	}
 	root, err := os.OpenRoot(s.root)
 	if err != nil {
@@ -178,10 +151,10 @@ func (s *libraryStore) purgeCaptures(ids []string) (result purgeResult) {
 	defer root.Close()
 	var pending []capture
 	for _, item := range m.PendingPurges {
-		// Both attempts are idempotent. Failure of either retains the full intent.
+		// A failed unlink leaves the full intent so retries check all assets.
 		var err error
-		for _, asset := range item.ownedAssets() {
-			err = errors.Join(err, s.removeManaged(root, asset))
+		for _, asset := range item.assets() {
+			err = errors.Join(err, removeManaged(root, asset.managed))
 		}
 		if err != nil {
 			pending = append(pending, item)
@@ -198,7 +171,7 @@ func (s *libraryStore) purgeCaptures(ids []string) (result purgeResult) {
 // Exact relative names were validated against the stable ID and media format
 // before intent. Root confines even a concurrent symlink replacement to this
 // library. Refuse redirected managed directories and non-files; never recurse.
-func (s *libraryStore) removeManaged(root *os.Root, path string) error {
+func removeManaged(root *os.Root, path string) error {
 	dir := filepath.Dir(path)
 	info, err := root.Lstat(dir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -220,7 +193,7 @@ func (s *libraryStore) removeManaged(root *os.Root, path string) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("managed file is not regular: %s", path)
 	}
-	if err = s.remove(root, path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err = root.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	// Do not discard intent until each unlink is durable.
@@ -240,11 +213,28 @@ func (a *app) enqueueTrash(op trashOperation) {
 		return
 	}
 	op.IDs = slices.Clone(op.IDs)
-	a.enqueueImport(func() (importInput, error) { return importInput{trash: &op}, nil })
+	a.enqueueLibraryJob(libraryJob{run: func(store *libraryStore) func() {
+		snapshot, err := store.setTrashedSnapshot(op.IDs, op.Restore)
+		return func() {
+			success, failure, recovery := "Moved to Trash", "Could not move captures to Trash", "Open the capture’s context menu and try Move to Trash again."
+			if op.Restore {
+				success, failure, recovery = "Restored", "Could not restore captures", "Open the capture’s context menu in Trash and try Restore again."
+			}
+			if err != nil {
+				a.report(failure, err.Error(), recovery)
+				a.announce(failure)
+				return
+			}
+			a.publishSnapshot(snapshot)
+			a.announce(success)
+		}
+	}})
 }
 
+const deleteRecovery = "Check library permissions and try again from Trash."
+
 func (a *app) confirmDeletePermanently(ids []string) {
-	if a.closed || a.store == nil || a.loadError != nil || a.nativeDialogs > 0 || a.collectionDialog != nil || a.linkDialog != nil || a.confirmPermanentDeletion == nil || len(ids) == 0 {
+	if a.closed || a.store == nil || a.loadError != nil || a.nativeDialogs > 0 || a.collectionDialog != nil || a.linkDialog != nil || len(ids) == 0 {
 		return
 	}
 	ids = slices.Clone(ids)
@@ -262,25 +252,41 @@ func (a *app) confirmDeletePermanently(ids []string) {
 		}
 	}
 	returnFocus := a.focus
-	a.nativeDialogs++
-	go func() {
-		confirmed, err := a.confirmPermanentDeletion(message)
-		a.update(func() {
-			a.nativeDialogs--
-			if a.closed {
+	a.nativeMessage(mygo.MessageOptions{
+		Type: mygo.MessageWarning, Title: "Delete Permanently", Message: message,
+		Detail: "This can’t be undone.", Buttons: []string{"Cancel", "Delete Permanently"},
+		DefaultButton: 0, CancelButton: 0,
+	}, func(result mygo.MessageResult, err error) {
+		a.focus = returnFocus
+		a.reconcileVisible(a.visibleItems())
+		if err != nil {
+			a.report("Could not delete captures permanently", err.Error(), deleteRecovery)
+			return
+		}
+		if result.Button == 1 {
+			a.enqueuePermanentDeletion(ids)
+		}
+	})
+}
+
+func (a *app) enqueuePermanentDeletion(ids []string) {
+	a.enqueueLibraryJob(libraryJob{run: func(store *libraryStore) func() {
+		result := store.deletePermanently(ids, a.beforePurgeUnlink)
+		return func() {
+			a.finishPurge(result)
+			if result.Err == nil {
+				a.cleanupError = ""
+				a.announce("Deleted permanently")
 				return
 			}
-			a.focus = returnFocus
-			a.reconcileVisible(a.visibleItems())
-			if err != nil {
-				a.report("Could not delete captures permanently", err.Error())
-				return
+			title, recovery := "Could not delete captures permanently", deleteRecovery
+			if result.Publish {
+				title, recovery = "Deletion could not finish", "Check library permissions. Keeps will retry automatically."
 			}
-			if confirmed {
-				a.enqueueImport(func() (importInput, error) { return importInput{deleteIDs: ids}, nil })
-			}
-		})
-	}()
+			a.report(title, result.Err.Error(), recovery)
+			a.announce(title)
+		}
+	}})
 }
 
 func (a *app) requestCleanup() {
@@ -288,31 +294,46 @@ func (a *app) requestCleanup() {
 		return
 	}
 	a.cleanupQueued = true
-	a.enqueueImport(func() (importInput, error) { return importInput{purge: true}, nil })
-}
-
-func (a *app) publishItems(items []capture) {
-	previous := a.visibleItems()
-	a.items = items
-	current := a.visibleItems()
-	visible := make(map[string]bool, len(current))
-	for _, item := range current {
-		visible[item.ID] = true
-	}
-	if a.media != nil {
-		for id := range a.media.stillGIFs {
-			if !visible[id] {
-				delete(a.media.stillGIFs, id)
+	a.enqueueLibraryJob(libraryJob{run: func(store *libraryStore) func() {
+		result := store.cleanupExpired(a.beforePurgeUnlink)
+		return func() {
+			a.cleanupQueued = false
+			a.finishPurge(result)
+			if result.Err == nil {
+				a.cleanupError = ""
+				return
+			}
+			if detail := result.Err.Error(); detail != a.cleanupError {
+				a.announce("Trash cleanup could not finish; Keeps will retry.")
+				a.report("Trash cleanup could not finish", "Keeps will retry. "+detail, "")
+				log.Printf("Trash cleanup: %s", detail)
+				a.cleanupError = detail
 			}
 		}
+	}})
+}
+
+func (a *app) finishPurge(result purgeResult) {
+	a.purging = false
+	if result.Publish {
+		a.publishSnapshot(manifest{Items: result.Items, Collections: result.Collections})
 	}
-	if slices.ContainsFunc(previous, func(item capture) bool { return !visible[item.ID] }) {
-		// Discard clipboard preparation for a removed visible capture. An
-		// hourly check that removed nothing must not cancel a pending Copy.
-		a.copyGeneration++
+}
+
+func (a *app) beforePurgeUnlink(snapshot manifest) error {
+	// RunOnMain can return without invoking the callback after Mygo quits.
+	// Leave the durable purge intent in place if the handoff did not run.
+	acknowledged := false
+	mygo.RunOnMain(func() {
+		if a.closed {
+			return
+		}
+		a.preparePurgeSnapshot(snapshot)
+		a.window.Invalidate()
+		acknowledged = true
+	})
+	if !acknowledged {
+		return fmt.Errorf("Keeps closed before releasing captures for Trash cleanup")
 	}
-	if a.thumbnails != nil {
-		a.thumbnails.retain(items)
-	}
-	a.reconcileVisible(current)
+	return nil
 }

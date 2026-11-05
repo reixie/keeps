@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"image"
 	"math"
 	"path/filepath"
@@ -13,7 +12,6 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-// Four decoders, at most 512 pixels on the longest edge, sampled at 30 Hz.
 // Waiting and failed cards retain their cached posters. Native preview has an
 // independent lifecycle and never reuses an inline player's audio state.
 const inlinePlayerLimit = 4
@@ -31,11 +29,19 @@ type playbackBackend interface {
 	state() (eligible, preview bool)
 	add(id, path string)
 	remove(id string)
-	frame(id string, pixels *image.RGBA) int
+	frame(id string, pixels *image.RGBA) inlineFrameStatus
 	preview(records []previewRecord, target string)
-	current() string
 	close()
 }
+
+// Values match the frame results returned by the Swift adapter.
+type inlineFrameStatus int32
+
+const (
+	inlineFrameStill  inlineFrameStatus = -2
+	inlineFrameFailed inlineFrameStatus = -1
+	inlineFrameReady  inlineFrameStatus = 1
+)
 
 type inlineFrame struct {
 	pixels *image.RGBA
@@ -115,7 +121,7 @@ func (a *app) previewRecords() []previewRecord {
 
 func (a *app) previewTarget() (capture, bool) {
 	items := a.visibleItems()
-	if id, ok := strings.CutPrefix(a.focus, "capture:"); ok {
+	if id, ok := strings.CutPrefix(a.focus, captureFocusPrefix); ok {
 		for _, item := range items {
 			if item.ID == id {
 				return item, true
@@ -125,7 +131,7 @@ func (a *app) previewTarget() (capture, bool) {
 	}
 	if a.focus == focusLibrary {
 		for _, item := range items {
-			if a.selection[item.ID] {
+			if a.selection.has(item.ID) {
 				return item, true
 			}
 		}
@@ -142,7 +148,7 @@ func (a *app) showPreview(item capture) {
 	}
 	m := a.media
 	if !m.previewOpen {
-		m.savedFocus, m.savedScroll = a.focus, a.libraryScroll.Y
+		m.savedFocus, m.savedScroll = a.focus, a.grid.scroll.Y
 	}
 	m.releaseInline()
 	m.backend.preview(a.previewRecords(), item.ID)
@@ -156,9 +162,33 @@ func (m *mediaController) releaseInline() {
 	clear(m.frames)
 }
 
-func (a *app) restorePreviewState() {
-	a.focus, a.libraryScroll.Y = a.media.savedFocus, a.media.savedScroll
-	a.reconcileVisible(a.visibleItems())
+func (m *mediaController) retainGIFs(visible map[string]bool) {
+	if m == nil {
+		return
+	}
+	for id := range m.stillGIFs {
+		if !visible[id] {
+			delete(m.stillGIFs, id)
+		}
+	}
+}
+
+func (m *mediaController) close() {
+	if m == nil {
+		return
+	}
+	m.stop()
+	m.releaseInline()
+	m.backend.close()
+}
+
+func (a *app) reconcilePreviewState(open bool) {
+	m := a.media
+	if m.previewOpen && !open {
+		a.focus, a.grid.scroll.Y = m.savedFocus, m.savedScroll
+		a.reconcileVisible(a.visibleItems())
+	}
+	m.previewOpen = open
 }
 
 // Native close can precede the next idle tick. Reconcile before handling the
@@ -169,10 +199,7 @@ func (a *app) previewOwnsFocus() bool {
 	}
 	if a.media.previewOpen {
 		_, open := a.media.backend.state()
-		if !open {
-			a.restorePreviewState()
-			a.media.previewOpen = false
-		}
+		a.reconcilePreviewState(open)
 	}
 	return a.media.previewOpen
 }
@@ -187,10 +214,7 @@ func (a *app) tickPlayback() {
 		m.backend.preview(a.previewRecords(), "")
 		_, preview = m.backend.state()
 	}
-	if m.previewOpen && !preview {
-		a.restorePreviewState()
-	}
-	m.previewOpen = preview
+	a.reconcilePreviewState(preview)
 	desired := m.desired
 	if !eligible || preview || a.reduceMotion || a.purging {
 		desired = nil
@@ -212,7 +236,6 @@ func (a *app) tickPlayback() {
 			w, h := max(1, int(math.Round(float64(item.Width)*scale))), max(1, int(math.Round(float64(item.Height)*scale)))
 			entry = &inlineFrame{pixels: image.NewRGBA(image.Rect(0, 0, w, h))}
 			m.frames[item.ID] = entry
-			m.backend.add(item.ID, filepath.Join(a.store.root, item.Original))
 		}
 		if entry.failed {
 			continue
@@ -221,17 +244,17 @@ func (a *app) tickPlayback() {
 		// two Go ticks, even when the app becomes active again immediately.
 		m.backend.add(item.ID, filepath.Join(a.store.root, item.Original))
 		switch m.backend.frame(item.ID, entry.pixels) {
-		case -2: // static GIF: free this slot for an actual animation/video
+		case inlineFrameStill:
 			m.backend.remove(item.ID)
 			delete(m.frames, item.ID)
 			if m.stillGIFs == nil {
 				m.stillGIFs = make(map[string]bool)
 			}
 			m.stillGIFs[item.ID] = true
-		case -1:
+		case inlineFrameFailed:
 			m.backend.remove(item.ID)
 			entry.bitmap, entry.failed = nil, true
-		case 1:
+		case inlineFrameReady:
 			if entry.bitmap == nil {
 				entry.bitmap = ui.NewBitmap(entry.pixels)
 			} else {
@@ -266,7 +289,7 @@ func (a *app) startPlayback(backend playbackBackend) {
 					continue
 				}
 				last = time.Now()
-				a.update(func() { defer queued.Store(false); a.tickPlayback() })
+				a.window.Update(func() { defer queued.Store(false); a.tickPlayback() })
 			}
 		}
 	}()
@@ -275,10 +298,6 @@ func (a *app) startPlayback(backend playbackBackend) {
 // Called under the store lock after durable purge intent, before any unlink.
 // The serial worker waits for the UI owner to release native references. Late
 // thumbnail/player completions cannot republish removed IDs.
-func (a *app) preparePurge(retained []capture) {
-	a.preparePurgeSnapshot(manifest{Items: retained, Collections: a.collections})
-}
-
 func (a *app) preparePurgeSnapshot(snapshot manifest) {
 	a.purging = true
 	if a.media != nil {
@@ -289,13 +308,4 @@ func (a *app) preparePurgeSnapshot(snapshot manifest) {
 	if a.media != nil {
 		a.media.backend.preview(a.previewRecords(), "")
 	}
-}
-
-// Keep serialization in one place for the narrow native ABI.
-func encodePreview(records []previewRecord) string {
-	if records == nil {
-		records = []previewRecord{}
-	}
-	data, _ := json.Marshal(records)
-	return string(data)
 }

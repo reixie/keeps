@@ -1,20 +1,25 @@
 package main
 
 import (
+	"context"
 	"log"
 
 	"github.com/egoist/mygo"
-	"github.com/egoist/mygo/transfer"
 	"github.com/egoist/mygo/ui"
 )
 
 const (
-	referenceWidth  = 1200
-	referenceHeight = 800
-	sidebarWidth    = 248
-	contentPadding  = 4
-	panelRadius     = 12
-	dragHeight      = 52
+	referenceWidth      = 1200
+	referenceHeight     = 800
+	sidebarWidth        = 248
+	contentPadding      = 4
+	panelRadius         = 12
+	dragHeight          = 52
+	sidebarControlSize  = 32
+	sidebarControlGap   = 4
+	sidebarControlTop   = 12
+	sidebarControlInset = 12
+	panelBorderWidth    = 1
 )
 
 type app struct {
@@ -22,52 +27,36 @@ type app struct {
 	navigation               navigationState
 	focus                    string
 	sidebarMenu              *mygo.MenuItem
-	invalidate               func()
 	window                   *mygo.Window
-	update                   func(func())
-	pickMedia                func() ([]string, error)
-	confirmPermanentDeletion func(string) (bool, error)
+	captureMenu              *macCaptureMenu
 	store                    *libraryStore
 	items                    []capture
 	collections              []collection
 	collectionDialog         *collectionDialogState
 	linkDialog               *linkDialogState
-	contextCollection        string
-	contextCollections       []collectionMenuEntry
+	cardMenu                 *captureMenuSnapshot
 	contextSidebarCollection collection
-	loading, importing       bool
+	loading                  bool
 	loadError                error
-	// Completion text is used only for accessibility announcements.
-	status            string
-	announcements     []string
-	thumbnails        *thumbnailCache
-	libraryScroll     ui.ScrollState
-	layout            masonryLayout
-	layoutWidth       float32
-	layoutItems       []capture
-	selection         captureSelection
-	selectionOrder    []string
-	importQueue       []importBatch
-	pasteQueue        []pasteRequest
-	pasteWork         *pasteWork
-	picking           bool
-	nativeDialogs     int
-	copyGeneration    uint64
-	readClipboard     func() (transfer.Data, error)
-	writeClipboard    func(transfer.Data) error
-	rasterOriginal    func(string) ([]byte, error)
-	pointerActivation string
-	contextCard       string
-	contextAction     starredOperation
-	contextTrash      trashOperation
-	focusNeedsReveal  bool
-	cleanupQueued     bool
-	closed            bool
-	stopRetention     func()
-	cleanupError      string
-	reduceMotion      bool
-	media             *mediaController
-	purging           bool
+	announcements            []string
+	thumbnails               *thumbnailCache
+	grid                     captureGrid
+	selection                captureSelection
+	libraryJobs              []libraryJob
+	libraryJobRunning        bool
+	pasteQueue               []pasteRequest
+	pasteCancel              context.CancelFunc
+	picking                  bool
+	nativeDialogs            int
+	copyGeneration           uint64
+	pointerActivation        string
+	cleanupQueued            bool
+	closed                   bool
+	stopRetention            func()
+	cleanupError             string
+	reduceMotion             bool
+	media                    *mediaController
+	purging                  bool
 }
 
 func (a *app) view(c *ui.Context) {
@@ -89,10 +78,9 @@ func (a *app) view(c *ui.Context) {
 	widgetTheme.Radius = 8
 	c.SetTheme(&widgetTheme)
 	c.Root().Background(ui.Transparent)
-	background := t.BackgroundTranslucent.Alpha(materialTintStrength)
+	background := ui.Transparent
 	if a.reduceTransparency || !c.Vibrancy() {
 		background = t.BackgroundTranslucent
-		background.A = 255
 	}
 	ui.Row(c).Fill().AlignItems(ui.Stretch).Background(background).Children(func() {
 		if !a.navigation.hidden {
@@ -107,11 +95,11 @@ func (a *app) view(c *ui.Context) {
 	toggleX := a.sidebarToggleX(c)
 	controlsLeft := toggleX
 	if !a.navigation.hidden {
-		controlsLeft -= 36 // 32-point Add capture, then the four-point gap.
+		controlsLeft -= sidebarControlSize + sidebarControlGap
 	}
 	ui.Box(c).Absolute().Left(0).Top(0).Width(controlsLeft).Height(dragHeight).DragWindow()
 	if !a.navigation.hidden {
-		ui.Box(c).Absolute().Left(toggleX + 32).Top(0).Width(sidebarWidth - toggleX - 32).Height(dragHeight).DragWindow()
+		ui.Box(c).Absolute().Left(toggleX + sidebarControlSize).Top(0).Width(sidebarWidth - toggleX - sidebarControlSize).Height(dragHeight).DragWindow()
 	}
 	if !a.navigation.hidden {
 		a.sidebarAddCapture(c, t, controlsLeft)
@@ -142,6 +130,7 @@ func main() {
 			MinHeight:      min(220, height),
 			TitleBarStyle:  mygo.TitleBarHiddenInset,
 			TitleBarHeight: dragHeight,
+			Transparent:    true,
 			Vibrancy:       mygo.VibrancySidebar,
 			Content:        ui.View(a.view),
 		})
@@ -153,35 +142,19 @@ func main() {
 		})
 		followWindowActivity(win)
 		a.window = win
-		a.update = win.Update
-		a.pickMedia = func() ([]string, error) {
-			// Let readable bytes decide support, including media with misleading
-			// suffixes. The importer reports unsupported files per item.
-			return mygo.Dialog.Open(mygo.OpenDialogOptions{Parent: win, Title: "Add capture", ButtonLabel: "Import", Multiple: true})
+		menu, err := newMacCaptureMenu(win.NativeHandle(), a.captureMenuClosed)
+		if err != nil {
+			log.Printf("Native capture menu unavailable: %v", err)
 		}
-		a.confirmPermanentDeletion = func(message string) (bool, error) {
-			result, err := mygo.Dialog.Message(mygo.MessageOptions{Parent: win, Type: mygo.MessageWarning,
-				Title: "Delete Permanently", Message: message, Detail: "This can’t be undone.",
-				Buttons: []string{"Cancel", "Delete Permanently"}, DefaultButton: 0, CancelButton: 0})
-			return result.Button == 1, err
-		}
+		a.captureMenu = menu
 		if backend, err := newMacPlayback(win.NativeHandle()); err != nil {
 			log.Printf("Native playback unavailable: %v", err)
-			a.status = "Native viewing could not start"
-			a.announce(a.status)
-			a.report(a.status, err.Error())
+			const title = "Native viewing could not start"
+			a.announce(title)
+			a.report(title, err.Error(), "")
 		} else {
 			a.startPlayback(backend)
 		}
-		a.invalidate = win.Invalidate
-		a.readClipboard = readCaptureClipboard
-		a.writeClipboard = func(data transfer.Data) error {
-			if err := mygo.Clipboard.Write(data); err != nil {
-				return err
-			}
-			return mygo.Clipboard.Flush()
-		}
-		a.rasterOriginal = originalPNG
 		a.installMenu()
 		off := mygo.Theme.OnUpdated(func() {
 			a.reduceTransparency = mygo.Theme.Preferences().ReduceTransparency

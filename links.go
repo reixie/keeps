@@ -6,19 +6,16 @@ import (
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
-	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -26,21 +23,8 @@ import (
 	"golang.org/x/net/html/charset"
 )
 
-const captureMedia = "media"
-const captureLink = "link"
-const linkCaptionHeight = float32(28)
-
 //go:embed resources/link-globe.png
 var linkGlobe []byte
-
-func (c capture) isLink() bool { return c.Kind == captureLink }
-func (c capture) ownedAssets() []string {
-	paths := []string{c.Original, c.Preview}
-	if c.isLink() {
-		paths = append(paths, c.Favicon, c.QuickLook)
-	}
-	return paths
-}
 
 // Only the scheme and DNS spelling are normalized. Escaped path, query order,
 // explicit ports, trailing slash and fragment retain their submitted meaning.
@@ -118,8 +102,7 @@ func linkDigest(raw string) string {
 func validLinkCapture(c capture) bool {
 	normalized, err := normalizeLink(c.URL)
 	return err == nil && normalized == c.URL && c.Title != "" && len(c.Title) <= 4096 && c.SHA256 == linkDigest(c.URL) &&
-		c.MediaType == "link" && c.Format == "webloc" && c.Width > 0 && c.Height > 0 && c.Width <= 16384 && c.Height <= 16384 &&
-		c.Favicon == "previews/"+c.ID+"-favicon.png" && c.QuickLook == "previews/"+c.ID+"-quicklook.png"
+		c.MediaType == "link" && c.Format == "webloc" && c.Width > 0 && c.Height > 0 && c.Width <= 16384 && c.Height <= 16384
 }
 
 type linkMetadata struct {
@@ -249,33 +232,13 @@ func fetchLinkBytes(ctx context.Context, client *http.Client, u *url.URL, limit 
 	return data, resp.Request.URL, resp.Header.Get("Content-Type"), err
 }
 
-func runLinkHelper(ctx context.Context, args ...string) ([]byte, error) {
-	select {
-	case nativeMediaSlots <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	defer func() { <-nativeMediaSlots }()
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, nativeHelper(), args...).Output()
-	if err != nil {
-		return nil, fmt.Errorf("Could not prepare local link images: %w", err)
-	}
-	return out, nil
-}
-
 type preparedLink struct {
-	item       capture
-	stage      string
-	incomplete bool
-	state      atomic.Int32
+	item  capture
+	stage string
 }
 
 func (p *preparedLink) cleanup() {
-	if p != nil {
-		_ = os.RemoveAll(p.stage)
-	}
+	_ = os.RemoveAll(p.stage)
 }
 
 // All HTTP, parsing, image normalization and composition finish before enqueue.
@@ -298,12 +261,14 @@ func (s *libraryStore) prepareLink(ctx context.Context, raw string) (_ *prepared
 			p.cleanup()
 		}
 	}()
-	id, err := newCollectionID()
+	id, err := newLibraryID()
 	if err != nil {
 		return nil, err
 	}
 	u, _ := url.Parse(normalized)
-	p.item = capture{ID: id, Kind: captureLink, Filename: u.Hostname() + ".webloc", Original: "originals/" + id + ".webloc", Preview: "previews/" + id + ".png", Favicon: "previews/" + id + "-favicon.png", QuickLook: "previews/" + id + "-quicklook.png", URL: normalized, Title: u.Hostname(), MediaType: "link", Format: "webloc", Width: 3, Height: 2, SHA256: linkDigest(normalized)}
+	p.item = capture{ID: id, Kind: captureLink, Filename: u.Hostname() + ".webloc", URL: normalized, Title: u.Hostname(),
+		MediaType: "link", Format: "webloc", Width: 3, Height: 2, SHA256: linkDigest(normalized)}
+	p.item.setManagedPaths()
 	client := linkHTTPClient()
 	defer client.CloseIdleConnections()
 	networkCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
@@ -317,9 +282,9 @@ func (s *libraryStore) prepareLink(ctx context.Context, raw string) (_ *prepared
 	if metadata.Title != "" {
 		p.item.Title = metadata.Title
 	}
-	preview := filepath.Join(stage, "preview.png")
-	favicon := filepath.Join(stage, "favicon.png")
-	asset := func(candidates []string, output string, edge string) (mediaInfo, bool) {
+	preview := filepath.Join(stage, stagedPreview)
+	favicon := filepath.Join(stage, stagedFavicon)
+	asset := func(candidates []string, output string, edge int) (mediaInfo, bool) {
 		for _, candidate := range candidates {
 			if networkCtx.Err() != nil {
 				break
@@ -337,23 +302,19 @@ func (s *libraryStore) prepareLink(ctx context.Context, raw string) (_ *prepared
 			if e = os.WriteFile(input, data, 0600); e != nil {
 				continue
 			}
-			out, e := runLinkHelper(networkCtx, "--link-image", input, output, edge)
+			info, e := nativeLinkImage(networkCtx, input, output, edge)
 			_ = os.Remove(input)
-			if e != nil {
-				continue
-			}
-			var info mediaInfo
-			if json.Unmarshal(out, &info) == nil && info.Width > 0 && info.Height > 0 {
+			if e == nil {
 				return info, true
 			}
 		}
 		return mediaInfo{}, false
 	}
-	info, hasPreview := asset(append(slices.Clone(metadata.Images), metadata.Twitter...), preview, "1024")
+	info, hasPreview := asset(append(slices.Clone(metadata.Images), metadata.Twitter...), preview, 1024)
 	if hasPreview {
 		p.item.Width, p.item.Height = info.Width, info.Height
 	} else {
-		if _, err = runLinkHelper(ctx, "--link-placeholder", preview); err != nil {
+		if err = nativeLinkPlaceholder(ctx, preview); err != nil {
 			return nil, err
 		}
 	}
@@ -364,29 +325,24 @@ func (s *libraryStore) prepareLink(ctx context.Context, raw string) (_ *prepared
 	origin.ForceQuery = false
 	origin.Fragment = ""
 	origin.RawFragment = ""
-	_, hasIcon := asset(append(slices.Clone(metadata.Icons), origin.String()), favicon, "64")
+	_, hasIcon := asset(append(slices.Clone(metadata.Icons), origin.String()), favicon, 64)
 	if !hasIcon {
 		if err = os.WriteFile(favicon, linkGlobe, 0600); err != nil {
 			return nil, err
 		}
 	}
-	p.incomplete = !hasPreview || metadata.Title == ""
 	var escaped bytes.Buffer
 	_ = xml.EscapeText(&escaped, []byte(normalized))
 	bookmark := []byte("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>URL</key><string>" + escaped.String() + "</string></dict></plist>\n")
-	if err = os.WriteFile(filepath.Join(stage, "original"), bookmark, 0600); err != nil {
+	if err = os.WriteFile(filepath.Join(stage, stagedOriginal), bookmark, 0600); err != nil {
 		return nil, err
 	}
-	composition, _ := json.Marshal(map[string]string{"image": preview, "favicon": favicon, "title": p.item.Title, "url": normalized})
-	spec := filepath.Join(stage, "composition.json")
-	if err = os.WriteFile(spec, composition, 0600); err != nil {
+	composition := linkComposition{Image: preview, Favicon: favicon, Title: p.item.Title, URL: normalized}
+	if err = nativeLinkCompose(ctx, filepath.Join(stage, "composition.json"), filepath.Join(stage, stagedQuickLook), composition); err != nil {
 		return nil, err
 	}
-	if _, err = runLinkHelper(ctx, "--link-compose", spec, filepath.Join(stage, "quicklook.png")); err != nil {
-		return nil, err
-	}
-	for _, name := range []string{"original", "preview.png", "favicon.png", "quicklook.png"} {
-		if err = syncFile(filepath.Join(stage, name)); err != nil {
+	for _, asset := range p.item.assets() {
+		if err = syncFile(filepath.Join(stage, asset.staged)); err != nil {
 			return nil, err
 		}
 	}
@@ -398,10 +354,6 @@ func (s *libraryStore) prepareLink(ctx context.Context, raw string) (_ *prepared
 }
 
 func (s *libraryStore) saveLink(p *preparedLink, destination string) (result importResult) {
-	if !p.state.CompareAndSwap(0, 1) {
-		result.Fatal = fmt.Errorf("Link save was cancelled")
-		return
-	}
 	fail := func(err error) importResult { result.Fatal = err; return result }
 	unlock, err := s.lockMetadata()
 	if err != nil {
@@ -438,44 +390,17 @@ func (s *libraryStore) saveLink(p *preparedLink, destination string) (result imp
 			return result
 		}
 	}
-	for _, dir := range []string{"originals", "previews"} {
-		if err = os.MkdirAll(filepath.Join(s.root, dir), 0755); err != nil {
-			return fail(err)
-		}
+	if err = s.createManagedDirs(); err != nil {
+		return fail(err)
 	}
 	item := p.item
-	item.ImportedAt = s.now().UTC()
+	item.ImportedAt = time.Now().UTC()
 	if destination != "" {
 		item.CollectionIDs = []string{destination}
 	}
-	sources := []string{"original", "preview.png", "favicon.png", "quicklook.png"}
-	var linked []string
-	committed := false
-	defer func() {
-		if !committed {
-			for _, path := range linked {
-				_ = os.Remove(path)
-			}
-		}
-	}()
-	for i, asset := range item.ownedAssets() {
-		dest := filepath.Join(s.root, asset)
-		if err = os.Link(filepath.Join(p.stage, sources[i]), dest); err != nil {
-			return fail(err)
-		}
-		linked = append(linked, dest)
-	}
-	for _, dir := range []string{"originals", "previews"} {
-		if err = syncDirectory(filepath.Join(s.root, dir)); err != nil {
-			return fail(err)
-		}
-	}
-	m.Items = append([]capture{item}, m.Items...)
-	sortCaptures(m.Items)
-	if err = s.writeManifest(m); err != nil {
+	if err = s.installCapture(&m, item, p.stage); err != nil {
 		return fail(err)
 	}
-	committed = true
 	result.Items, result.Collections, result.Added = m.Items, m.Collections, 1
 	return result
 }

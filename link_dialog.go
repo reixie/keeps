@@ -11,17 +11,15 @@ type linkDialogState struct {
 	URL, Validation, Error          string
 	Destination, ReturnFocus, Focus string
 	cancel                          context.CancelFunc
-	prepared                        *preparedLink
 }
 
 func (a *app) addLink() {
-	if a.collectionDialog != nil || a.linkDialog != nil || a.picking || a.loading || a.store == nil || a.loadError != nil {
+	if a.closed || a.collectionDialog != nil || a.linkDialog != nil || a.picking || a.loading || a.store == nil || a.loadError != nil {
 		return
 	}
+	a.captureMenu.dismiss()
 	a.linkDialog = &linkDialogState{Open: true, Destination: a.activeCollectionID(), ReturnFocus: a.focus, Focus: "link-url"}
-	if a.invalidate != nil {
-		a.invalidate()
-	}
+	a.window.Invalidate()
 }
 func (a *app) closeLinkDialog(d *linkDialogState) {
 	if a.linkDialog != d || d.Saving {
@@ -31,13 +29,7 @@ func (a *app) closeLinkDialog(d *linkDialogState) {
 		d.cancel()
 	}
 	a.linkDialog = nil
-	a.focus = d.ReturnFocus
-	if a.focus == "" {
-		a.focus = focusLibrary
-	}
-	if a.navigation.hidden && (a.focus == focusAddCapture || a.focus == focusNavigation) {
-		a.focus = focusToggle
-	}
+	a.restoreCaptureFocus(d.ReturnFocus)
 	a.reconcileVisible(a.visibleItems())
 }
 func (a *app) submitLink(d *linkDialogState) {
@@ -56,38 +48,44 @@ func (a *app) submitLink(d *linkDialogState) {
 	ctx, cancel := context.WithCancel(context.Background())
 	d.cancel = cancel
 	store := a.store
+	destination := d.Destination
 	go func() {
 		prepared, err := store.prepareLink(ctx, normalized)
-		a.update(func() {
-			if a.closed || a.linkDialog != d || ctx.Err() != nil {
-				if prepared != nil {
-					prepared.cleanup()
+		if err != nil {
+			a.window.Update(func() {
+				if a.closed || a.linkDialog != d || ctx.Err() != nil {
+					return
 				}
-				return
-			}
-			d.Preparing = false
-			if err != nil {
+				d.Preparing = false
 				cancel()
 				d.Focus = "link-url"
 				d.Error = "Could not prepare the link. Check available disk space and library permissions, then try Save Link again. " + err.Error()
 				a.announce(d.Error)
+			})
+			return
+		}
+		job := a.linkJob(prepared, destination, func(result importResult) {
+			d.Saving = false
+			cancel()
+			if result.Fatal != nil {
+				d.Focus = "link-url"
+				d.Error = "Could not save the link. Check available disk space and library permissions, then try Save Link again. " + result.Fatal.Error()
+				a.announce(d.Error)
+				a.announce("Could not save link")
 				return
 			}
+			a.closeLinkDialog(d)
+			a.announce(linkSavedStatus(result))
+			a.reportImportWarnings(result)
+		})
+		a.submitPrepared(ctx, job, func(job libraryJob) {
+			if a.linkDialog != d {
+				job.discard()
+				return
+			}
+			d.Preparing = false
 			d.Saving = true
-			d.prepared = prepared
-			a.enqueueImport(func() (importInput, error) {
-				return importInput{link: prepared, destination: d.Destination, cleanup: prepared.cleanup, completed: func(saveErr error) {
-					d.Saving = false
-					cancel()
-					if saveErr != nil {
-						d.Focus = "link-url"
-						d.Error = "Could not save the link. Check available disk space and library permissions, then try Save Link again. " + saveErr.Error()
-						a.announce(d.Error)
-						return
-					}
-					a.closeLinkDialog(d)
-				}}, nil
-			})
+			a.enqueueLibraryJob(job)
 		})
 	}()
 }
@@ -137,15 +135,14 @@ func (a *app) linkModal(c *ui.Context, t themeValues) {
 	c.SetTheme(base)
 }
 
-func linkSavedStatus(result importResult, p *preparedLink) string {
-	text := "Link saved"
-	if result.Duplicates > 0 {
-		text = "Link already saved"
-	}
+func linkSavedStatus(result importResult) string {
 	if result.InTrash > 0 {
-		text = "Link already in Trash; restore it there"
+		return "Link already in Trash; restore it there"
 	}
-	return text
+	if result.Duplicates > 0 {
+		return "Link already saved"
+	}
+	return "Link saved"
 }
 
 var linkGlobeIcon = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><circle cx="8" cy="8" r="6.3"/><ellipse cx="8" cy="8" rx="3" ry="6.3"/><path d="M1.7 8h12.6M2.5 4.8h11M2.5 11.2h11"/></svg>`))

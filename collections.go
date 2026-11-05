@@ -1,7 +1,6 @@
 package main
 
 import (
-	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -38,14 +37,6 @@ func sortCollections(collections []collection) {
 		}
 		return strings.Compare(a.ID, b.ID)
 	})
-}
-
-func newCollectionID() (string, error) {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
 }
 
 func validCollectionID(id string) bool {
@@ -109,33 +100,28 @@ func (s *libraryStore) updateCollections(op collectionOperation) (manifest, erro
 			return manifest{}, err
 		}
 	}
-	unlock, err := s.lockMetadata()
-	if err != nil {
-		return manifest{}, err
-	}
-	defer unlock()
-	m, err := s.readManifest()
-	if err != nil {
-		return manifest{}, err
-	}
+	return s.editManifest(op.apply)
+}
+
+func (op collectionOperation) apply(m *manifest) error {
 	for _, draft := range op.Create {
 		draft.Name = strings.TrimSpace(draft.Name)
 		if !validCollectionID(draft.ID) || hasCollection(m.Collections, draft.ID) {
-			return manifest{}, fmt.Errorf("collection ID is no longer available")
+			return fmt.Errorf("collection ID is no longer available")
 		}
 		if message := collectionNameError(draft.Name, "", m.Collections); message != "" {
-			return manifest{}, collectionNameConflict{draft.ID, message}
+			return collectionNameConflict{draft.ID, message}
 		}
 		m.Collections = append(m.Collections, draft)
 	}
 	if op.Edit != nil {
 		if !hasCollection(m.Collections, op.Edit.ID) {
-			return manifest{}, fmt.Errorf("This collection no longer exists.")
+			return fmt.Errorf("This collection no longer exists.")
 		}
 		edited := *op.Edit
 		edited.Name = strings.TrimSpace(edited.Name)
 		if message := collectionNameError(edited.Name, edited.ID, m.Collections); message != "" {
-			return manifest{}, collectionNameConflict{edited.ID, message}
+			return collectionNameConflict{edited.ID, message}
 		}
 		for i := range m.Collections {
 			if m.Collections[i].ID == edited.ID {
@@ -145,7 +131,7 @@ func (s *libraryStore) updateCollections(op collectionOperation) (manifest, erro
 	}
 	if op.DeleteID != "" {
 		if !hasCollection(m.Collections, op.DeleteID) {
-			return manifest{}, fmt.Errorf("This collection no longer exists.")
+			return fmt.Errorf("This collection no longer exists.")
 		}
 		m.Collections = slices.DeleteFunc(m.Collections, func(c collection) bool { return c.ID == op.DeleteID })
 		for _, items := range [][]capture{m.Items, m.PendingPurges} {
@@ -156,11 +142,11 @@ func (s *libraryStore) updateCollections(op collectionOperation) (manifest, erro
 	}
 	if len(op.Changes) > 0 {
 		if len(op.IDs) == 0 {
-			return manifest{}, fmt.Errorf("No captures targeted.")
+			return fmt.Errorf("No captures targeted.")
 		}
 		for id := range op.Changes {
 			if !hasCollection(m.Collections, id) {
-				return manifest{}, fmt.Errorf("The selected collection no longer exists. Reopen the capture’s context menu to refresh the list.")
+				return fmt.Errorf("The selected collection no longer exists. Reopen the capture’s context menu to refresh the list.")
 			}
 		}
 		targets := map[string]bool{}
@@ -173,7 +159,7 @@ func (s *libraryStore) updateCollections(op collectionOperation) (manifest, erro
 				continue
 			}
 			if item.TrashedAt != nil {
-				return manifest{}, fmt.Errorf("A targeted capture is now in Trash. Restore it before assigning collections.")
+				return fmt.Errorf("A targeted capture is now in Trash. Restore it before assigning collections.")
 			}
 			for id, checked := range op.Changes {
 				if checked && !slices.Contains(item.CollectionIDs, id) {
@@ -187,25 +173,11 @@ func (s *libraryStore) updateCollections(op collectionOperation) (manifest, erro
 			delete(targets, item.ID)
 		}
 		if len(targets) != 0 {
-			return manifest{}, fmt.Errorf("A targeted capture no longer exists.")
+			return fmt.Errorf("A targeted capture no longer exists.")
 		}
 	}
 	sortCollections(m.Collections)
-	if err := s.writeManifest(m); err != nil {
-		return manifest{}, err
-	}
-	return m, nil
-}
-
-func (a *app) publishSnapshot(m manifest) {
-	// Called once on the UI owner, before the next mutation may start.
-	a.collections = m.Collections
-	sortCollections(a.collections)
-	if id := a.activeCollectionID(); id != "" && !hasCollection(a.collections, id) {
-		a.navigation.selected = sectionLibrary
-		a.focus = focusLibrary
-	}
-	a.publishItems(m.Items)
+	return nil
 }
 
 func (a *app) enqueueCollections(op collectionOperation, done func(error)) {
@@ -215,5 +187,21 @@ func (a *app) enqueueCollections(op collectionOperation, done func(error)) {
 		}
 		return
 	}
-	a.enqueueImport(func() (importInput, error) { return importInput{collections: &op, completed: done}, nil })
+	a.enqueueLibraryJob(libraryJob{run: func(store *libraryStore) func() {
+		snapshot, err := store.updateCollections(op)
+		return func() {
+			title := "Collections updated"
+			if err == nil {
+				a.publishSnapshot(snapshot)
+			} else {
+				title = "Could not update collections"
+			}
+			if done != nil {
+				done(err)
+			} else if err != nil {
+				a.report(title, err.Error(), "")
+			}
+			a.announce(title)
+		}
+	}})
 }

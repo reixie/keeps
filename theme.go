@@ -14,7 +14,6 @@ type themeValues struct {
 	TextPrimary           ui.Color
 	TextSecondary         ui.Color
 	TextTertiary          ui.Color
-	TextDisabled          ui.Color
 	Hover                 ui.Color
 	Selected              ui.Color
 }
@@ -29,7 +28,6 @@ var (
 		TextPrimary:           ui.Hex("#000000"),
 		TextSecondary:         ui.Hex("#7D7D7D"),
 		TextTertiary:          ui.Hex("#A8A8A8"),
-		TextDisabled:          ui.Hex("#8D8D8D"),
 		Hover:                 ui.RGBA(0, 0, 0, 0.04),
 		Selected:              ui.RGBA(0, 0, 0, 0.06),
 	}
@@ -42,15 +40,10 @@ var (
 		TextPrimary:           ui.Hex("#FFFFFF"),
 		TextSecondary:         ui.Hex("#8F8E8E"),
 		TextTertiary:          ui.Hex("#616161"),
-		TextDisabled:          ui.Hex("#6E6E6E"),
 		Hover:                 ui.RGBA(255, 255, 255, 0.08),
 		Selected:              ui.RGBA(255, 255, 255, 0.12),
 	}
 )
-
-// The system material already supplies tint and opacity. Apply a fraction
-// of Figma's flat overlay so the desktop can still influence the material.
-const materialTintStrength = 0.25
 
 func themeFor(dark bool) themeValues {
 	if dark {

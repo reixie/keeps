@@ -30,42 +30,9 @@ func (a *app) startRetention() {
 		return
 	}
 	ticker := time.NewTicker(time.Hour)
-	request := func() { a.update(a.requestCleanup) }
+	request := func() { a.window.Update(a.requestCleanup) }
 	stop := scheduleRetention(ticker.C, request)
 	off := mygo.Power.OnResume(request)
 	a.stopRetention = func() { off(); ticker.Stop(); stop() }
 	a.requestCleanup()
-}
-
-func (a *app) shutdown() {
-	if a.closed {
-		return
-	}
-	a.closed = true
-	if a.pasteWork != nil {
-		a.pasteWork.stop()
-	}
-	a.pasteQueue = nil
-	if d := a.linkDialog; d != nil {
-		if d.cancel != nil {
-			d.cancel()
-		}
-		if d.prepared != nil && d.prepared.state.CompareAndSwap(0, 2) {
-			d.prepared.cleanup()
-		}
-	}
-	if a.media != nil {
-		if a.media.stop != nil {
-			a.media.stop()
-		}
-		a.media.releaseInline()
-		a.media.backend.close()
-	}
-	if a.stopRetention != nil {
-		a.stopRetention()
-	}
-	if a.thumbnails != nil {
-		close(a.thumbnails.stop)
-	}
-	a.importQueue = nil
 }

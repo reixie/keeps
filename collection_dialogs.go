@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"slices"
 	"strings"
 
@@ -15,11 +16,11 @@ type collectionForm struct {
 }
 
 type collectionDialogState struct {
-	Open, Saving              bool
-	ReturnFocus, Focus, Error string
-	Form                      *collectionForm
-	IDs                       []string
-	SelectCreated             bool
+	Open, Saving       bool
+	ReturnFocus, Focus string
+	Form               *collectionForm
+	IDs                []string
+	SelectCreated      bool
 }
 
 func (a *app) openCollectionForm(existing *collection, ids []string, selectCreated bool) {
@@ -60,7 +61,7 @@ func (a *app) submitCollectionForm(d *collectionDialogState) {
 		return
 	}
 	if f.ID == "" {
-		id, err := newCollectionID()
+		id, err := newLibraryID()
 		if err != nil {
 			f.SaveError = err.Error()
 			return
@@ -86,9 +87,9 @@ func (a *app) submitCollectionForm(d *collectionDialogState) {
 			} else {
 				f.SaveError = err.Error()
 			}
-			// Name conflicts discovered under the lock belong beside Name too.
-			if strings.Contains(err.Error(), "name") {
-				f.NameError, f.SaveError = err.Error(), ""
+			var conflict collectionNameConflict
+			if errors.As(err, &conflict) {
+				f.NameError, f.SaveError = conflict.Message, ""
 			}
 			a.announce(err.Error())
 			return
@@ -96,7 +97,7 @@ func (a *app) submitCollectionForm(d *collectionDialogState) {
 		a.closeCollectionDialog(d)
 		if d.SelectCreated && !f.Edit {
 			a.navigation.selected = collectionSection(entry.ID)
-			a.libraryScroll.Y = 0
+			a.grid.scroll.Y = 0
 			a.focus = focusNavigation
 			if a.navigation.hidden {
 				a.focus = focusLibrary
@@ -152,9 +153,10 @@ func (a *app) collectionFormView(c *ui.Context, t themeValues, d *collectionDial
 			OnChange(func() { f.NameError, f.SaveError = "", "" }).OnSubmit(func() { a.submitCollectionForm(d) })
 	}).Error(f.NameError)
 	ui.Row(c).AlignItems(ui.Center).Gap(12).Children(func() {
+		currentIcon := collectionIconFor(f.Icon)
 		ui.Text(c, "Icon").FontSize(13).TextColor(t.TextPrimary)
 		control := ui.ButtonBase(c).Key("collection-icon").Padding(6, 10).Gap(8).Radius(6).Border(1, t.Border).
-			Label("Icon: "+collectionIconLabel(f.Icon)).Tooltip("Choose collection icon").
+			Label("Icon: "+currentIcon.label).Tooltip("Choose collection icon").
 			FocusBind(&d.Focus, "collection-icon").Disabled(d.Saving)
 		if control.Hovered() {
 			control.Background(t.Hover)
@@ -163,18 +165,12 @@ func (a *app) collectionFormView(c *ui.Context, t themeValues, d *collectionDial
 			control.Background(t.Selected)
 		}
 		control.Children(func() {
-			ui.Icon(c, collectionIcon(f.Icon)).Size(16, 16).TextColor(t.TextSecondary)
-			ui.Text(c, collectionIconLabel(f.Icon)).FontSize(13)
+			ui.Icon(c, currentIcon.icon).Size(16, 16).TextColor(t.TextSecondary)
+			ui.Text(c, currentIcon.label).FontSize(13)
 		}).OnClick(func() {
 			f.Icons = !f.Icons
 			if f.Icons {
-				key := "folder"
-				for _, icon := range collectionIcons {
-					if icon.key == f.Icon {
-						key = icon.key
-					}
-				}
-				d.Focus = "icon:" + key
+				d.Focus = "icon:" + collectionIconFor(f.Icon).key
 			}
 		})
 	})
@@ -234,25 +230,17 @@ func (a *app) confirmDeleteCollection(entry collection) {
 		return
 	}
 	returnFocus := a.focus
-	a.nativeDialogs++
-	go func() {
-		result, err := mygo.Dialog.Message(mygo.MessageOptions{Parent: a.window, Type: mygo.MessageWarning,
-			Title: "Delete Collection", Message: "Delete “" + entry.Name + "”?",
-			Detail:  "Captures stay in Library.",
-			Buttons: []string{"Cancel", "Delete Collection"}, DefaultButton: 0, CancelButton: 0})
-		a.update(func() {
-			a.nativeDialogs--
-			if a.closed {
-				return
-			}
-			a.focus = returnFocus
-			if err != nil {
-				a.report("Could not delete collection", err.Error())
-				return
-			}
-			if result.Button == 1 {
-				a.enqueueCollections(collectionOperation{DeleteID: entry.ID}, nil)
-			}
-		})
-	}()
+	a.nativeMessage(mygo.MessageOptions{
+		Type: mygo.MessageWarning, Title: "Delete Collection", Message: "Delete “" + entry.Name + "”?",
+		Detail: "Captures stay in Library.", Buttons: []string{"Cancel", "Delete Collection"}, DefaultButton: 0, CancelButton: 0,
+	}, func(result mygo.MessageResult, err error) {
+		a.focus = returnFocus
+		if err != nil {
+			a.report("Could not delete collection", err.Error(), "")
+			return
+		}
+		if result.Button == 1 {
+			a.enqueueCollections(collectionOperation{DeleteID: entry.ID}, nil)
+		}
+	})
 }

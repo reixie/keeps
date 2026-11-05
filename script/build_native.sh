@@ -7,12 +7,32 @@ case "$arch" in
   amd64) swift_arch=x86_64 ;;
   *) echo "Expected arm64 or amd64" >&2; exit 1 ;;
 esac
-destination="resources/darwin-$arch/KeepsMedia"
-mkdir -p "$(dirname "$destination")"
-if [[ ! -x "$destination" || native/media.swift -nt "$destination" ]]; then
-  xcrun swiftc -O -parse-as-library -module-cache-path "${TMPDIR:-/tmp}/keeps-swift-module-cache" -target "$swift_arch-apple-macosx13.0" native/media.swift -o "$destination"
+minimum_os="$(/usr/bin/plutil -extract macos.minimumSystemVersion raw -o - mygo.json)"
+swift_flags=(-O -module-cache-path "${TMPDIR:-/tmp}/keeps-swift-module-cache" -target "$swift_arch-apple-macosx$minimum_os")
+media_sources=(native/media.swift)
+playback_sources=(native/playback.swift native/capture_menu.swift)
+
+needs_build() {
+  local output="$1" source
+  shift
+  if [[ ! -f "$output" ]]; then
+    return 0
+  fi
+  for source in script/build_native.sh mygo.json "$@"; do
+    if [[ ! -f "$source" || "$source" -nt "$output" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+resource_dir="resources/darwin-$arch"
+mkdir -p "$resource_dir"
+media="$resource_dir/KeepsMedia"
+if [[ ! -x "$media" ]] || needs_build "$media" "${media_sources[@]}"; then
+  xcrun swiftc "${swift_flags[@]}" -parse-as-library "${media_sources[@]}" -o "$media"
 fi
-playback="resources/darwin-$arch/libKeepsPlayback.dylib"
-if [[ ! -f "$playback" || native/playback.swift -nt "$playback" ]]; then
-  xcrun swiftc -O -emit-library -module-cache-path "${TMPDIR:-/tmp}/keeps-swift-module-cache" -target "$swift_arch-apple-macosx13.0" native/playback.swift -o "$playback"
+playback="$resource_dir/libKeepsPlayback.dylib"
+if needs_build "$playback" "${playback_sources[@]}"; then
+  xcrun swiftc "${swift_flags[@]}" -emit-library "${playback_sources[@]}" -o "$playback"
 fi

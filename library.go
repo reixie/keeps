@@ -10,7 +10,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"syscall"
@@ -19,7 +18,26 @@ import (
 
 const manifestVersion = 4
 
-func hostArch() string { return runtime.GOARCH }
+const (
+	captureMedia = "media"
+	captureLink  = "link"
+
+	originalsDir = "originals"
+	previewsDir  = "previews"
+
+	stagedOriginal  = "original"
+	stagedPreview   = "preview.png"
+	stagedFavicon   = "favicon.png"
+	stagedQuickLook = "quicklook.png"
+)
+
+func newLibraryID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(id[:]), nil
+}
 
 type capture struct {
 	Kind          string     `json:"kind"`
@@ -42,6 +60,37 @@ type capture struct {
 	CollectionIDs []string   `json:"collection_ids,omitempty"`
 }
 
+func (c capture) isLink() bool { return c.Kind == captureLink }
+
+func (c *capture) setManagedPaths() {
+	c.Original = originalsDir + "/" + c.ID + "." + c.Format
+	c.Preview = previewsDir + "/" + c.ID + ".png"
+	c.Favicon, c.QuickLook = "", ""
+	if c.isLink() {
+		c.Favicon = previewsDir + "/" + c.ID + "-favicon.png"
+		c.QuickLook = previewsDir + "/" + c.ID + "-quicklook.png"
+	}
+}
+
+func (c capture) validManagedPaths() bool {
+	expected := c
+	expected.setManagedPaths()
+	return c.Original == expected.Original && c.Preview == expected.Preview &&
+		c.Favicon == expected.Favicon && c.QuickLook == expected.QuickLook
+}
+
+type captureAsset struct {
+	staged, managed string
+}
+
+func (c capture) assets() []captureAsset {
+	assets := []captureAsset{{stagedOriginal, c.Original}, {stagedPreview, c.Preview}}
+	if c.isLink() {
+		assets = append(assets, captureAsset{stagedFavicon, c.Favicon}, captureAsset{stagedQuickLook, c.QuickLook})
+	}
+	return assets
+}
+
 type manifest struct {
 	Version       int          `json:"version"`
 	Items         []capture    `json:"items"`
@@ -50,26 +99,7 @@ type manifest struct {
 }
 
 type libraryStore struct {
-	root    string
-	preview mediaAdapter
-	// Metadata commits atomically replace the previous manifest.
-	commit func(string, []byte) error
-	now    func() time.Time
-	remove func(*os.Root, string) error
-	// Invoked by the mutation worker under the metadata lock after purge intent
-	// is durable, before unlinking. It synchronously hands ownership to the UI.
-	beforePurge         func(retained []capture)
-	beforePurgeSnapshot func(manifest)
-}
-
-func newLibraryStore(root string) *libraryStore {
-	return &libraryStore{root: root, preview: nativePreview, commit: atomicWrite, now: time.Now,
-		remove: func(root *os.Root, path string) error { return root.Remove(path) }}
-}
-
-func (s *libraryStore) load() ([]capture, error) {
-	m, err := s.loadSnapshot()
-	return m.Items, err
+	root string
 }
 
 func (s *libraryStore) loadSnapshot() (manifest, error) {
@@ -83,8 +113,7 @@ func (s *libraryStore) loadSnapshot() (manifest, error) {
 		return manifest{}, err
 	}
 	defer unlock()
-	m, err := s.readManifest()
-	return m, err
+	return s.readManifest()
 }
 
 // Caller holds the metadata lock. Pending entries validate identities/paths,
@@ -97,7 +126,7 @@ func (s *libraryStore) readManifest() (manifest, error) {
 		if _, statErr := os.Lstat(filepath.Join(s.root, "manifest.json")); statErr == nil || !errors.Is(statErr, os.ErrNotExist) {
 			return manifest{}, fmt.Errorf("read library manifest: %w", err)
 		}
-		for _, folder := range []string{"originals", "previews"} {
+		for _, folder := range []string{originalsDir, previewsDir} {
 			entries, readErr := os.ReadDir(filepath.Join(s.root, folder))
 			if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
 				return manifest{}, fmt.Errorf("read library: %w", readErr)
@@ -125,27 +154,17 @@ func (s *libraryStore) readManifest() (manifest, error) {
 	// happen to use the same names. Migration is written only by a mutation.
 	if m.Version < 3 {
 		m.Collections = nil
-		for i := range m.Items {
-			m.Items[i].CollectionIDs = nil
-		}
-		for i := range m.PendingPurges {
-			m.PendingPurges[i].CollectionIDs = nil
-		}
 	}
 	if m.Version < 4 {
-		for i := range m.Items {
-			m.Items[i].Kind = captureMedia
-			m.Items[i].URL = ""
-			m.Items[i].Title = ""
-			m.Items[i].Favicon = ""
-			m.Items[i].QuickLook = ""
-		}
-		for i := range m.PendingPurges {
-			m.PendingPurges[i].Kind = captureMedia
-			m.PendingPurges[i].URL = ""
-			m.PendingPurges[i].Title = ""
-			m.PendingPurges[i].Favicon = ""
-			m.PendingPurges[i].QuickLook = ""
+		for _, items := range [][]capture{m.Items, m.PendingPurges} {
+			for i := range items {
+				item := &items[i]
+				if m.Version < 3 {
+					item.CollectionIDs = nil
+				}
+				item.Kind = captureMedia
+				item.URL, item.Title, item.Favicon, item.QuickLook = "", "", "", ""
+			}
 		}
 	}
 	if err := validateCollectionMetadata(m); err != nil {
@@ -158,7 +177,7 @@ func (s *libraryStore) readManifest() (manifest, error) {
 		hash, hashErr := hex.DecodeString(item.SHA256)
 		if idErr != nil || len(id) != 16 || hashErr != nil || len(hash) != 32 || ids[item.ID] || hashes[item.SHA256] ||
 			item.Filename == "" || item.ImportedAt.IsZero() || !validTrashTime(item.TrashedAt) || pending && item.TrashedAt == nil || !validCaptureInfo(item) ||
-			item.Original != "originals/"+item.ID+"."+item.Format || item.Preview != "previews/"+item.ID+".png" {
+			!item.validManagedPaths() {
 			return manifest{}, fmt.Errorf("invalid library entry %q", item.ID)
 		}
 		ids[item.ID], hashes[item.SHA256] = true, true
@@ -186,7 +205,7 @@ func (s *libraryStore) writeManifest(m manifest) error {
 	if err != nil {
 		return err
 	}
-	return s.commit(filepath.Join(s.root, "manifest.json"), append(data, '\n'))
+	return atomicWrite(filepath.Join(s.root, "manifest.json"), append(data, '\n'))
 }
 
 func sortCaptures(items []capture) {
@@ -209,9 +228,8 @@ type importResult struct {
 	DestinationMissing bool
 }
 
-// importFiles serializes writers, reloads under the lock, and commits each
-// successful item independently. Cancellation never calls this function.
-func (s *libraryStore) importFiles(paths []string, progress func(int, int), destination ...string) (result importResult) {
+// Each successful file commits independently under the batch lock.
+func (s *libraryStore) importFiles(paths []string, destination string) (result importResult) {
 	if len(paths) == 0 {
 		return
 	}
@@ -235,21 +253,15 @@ func (s *libraryStore) importFiles(paths []string, progress func(int, int), dest
 		return failAll(err)
 	}
 	result.Items, result.Collections = m.Items, m.Collections
-	destinationID := ""
-	if len(destination) > 0 {
-		destinationID = destination[0]
-	}
-	if destinationID != "" && !hasCollection(m.Collections, destinationID) {
+	if destination != "" && !hasCollection(m.Collections, destination) {
 		result.DestinationMissing = true
-		destinationID = ""
+		destination = ""
 	}
-	for _, dir := range []string{"originals", "previews"} {
-		if err := os.MkdirAll(filepath.Join(s.root, dir), 0755); err != nil {
-			return failAll(err)
-		}
+	if err := s.createManagedDirs(); err != nil {
+		return failAll(err)
 	}
-	for i, path := range paths {
-		item, duplicate, err := s.importOne(path, &m, destinationID)
+	for _, path := range paths {
+		item, duplicate, err := s.importOne(path, &m, destination)
 		switch {
 		case err != nil:
 			result.Failures = append(result.Failures, importFailure{filepath.Base(path), err.Error()})
@@ -260,9 +272,6 @@ func (s *libraryStore) importFiles(paths []string, progress func(int, int), dest
 			}
 		default:
 			result.Added++
-		}
-		if progress != nil {
-			progress(i+1, len(paths))
 		}
 	}
 	result.Items, result.Collections = m.Items, m.Collections
@@ -287,17 +296,7 @@ func (s *libraryStore) lockMetadata() (func(), error) {
 	}, nil
 }
 
-// setStarred sets an explicit value for stable IDs in one atomic manifest
-// replacement. A missing target fails the whole batch, never a partial update.
-func (s *libraryStore) setStarred(ids []string, starred bool) ([]capture, error) {
-	m, err := s.setStarredSnapshot(ids, starred)
-	return m.Items, err
-}
-
-func (s *libraryStore) setStarredSnapshot(ids []string, starred bool) (manifest, error) {
-	if len(ids) == 0 {
-		return manifest{}, fmt.Errorf("no captures targeted")
-	}
+func (s *libraryStore) editManifest(edit func(*manifest) error) (manifest, error) {
 	unlock, err := s.lockMetadata()
 	if err != nil {
 		return manifest{}, err
@@ -307,24 +306,39 @@ func (s *libraryStore) setStarredSnapshot(ids []string, starred bool) (manifest,
 	if err != nil {
 		return manifest{}, err
 	}
-	items := m.Items
+	if err = edit(&m); err != nil {
+		return manifest{}, err
+	}
+	if err = s.writeManifest(m); err != nil {
+		return manifest{}, err
+	}
+	return m, nil
+}
+
+func editCaptureTargets(items []capture, ids []string, edit func(*capture)) error {
 	targets := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		targets[id] = true
 	}
 	for i := range items {
 		if targets[items[i].ID] {
-			items[i].Starred = starred
+			edit(&items[i])
 			delete(targets, items[i].ID)
 		}
 	}
 	if len(targets) != 0 {
-		return manifest{}, fmt.Errorf("targeted capture no longer exists")
+		return fmt.Errorf("targeted capture no longer exists")
 	}
-	if err = s.writeManifest(m); err != nil {
-		return manifest{}, err
+	return nil
+}
+
+func (s *libraryStore) setStarredSnapshot(ids []string, starred bool) (manifest, error) {
+	if len(ids) == 0 {
+		return manifest{}, fmt.Errorf("no captures targeted")
 	}
-	return m, nil
+	return s.editManifest(func(m *manifest) error {
+		return editCaptureTargets(m.Items, ids, func(item *capture) { item.Starred = starred })
+	})
 }
 
 func (s *libraryStore) importOne(path string, m *manifest, destination string) (item capture, duplicate bool, err error) {
@@ -345,7 +359,7 @@ func (s *libraryStore) importOne(path string, m *manifest, destination string) (
 		return item, false, err
 	}
 	defer os.RemoveAll(stage)
-	original, preview := filepath.Join(stage, "original"), filepath.Join(stage, "preview.png")
+	original, preview := filepath.Join(stage, stagedOriginal), filepath.Join(stage, stagedPreview)
 	hash := sha256.New()
 	if err = copySynced(original, io.TeeReader(source, hash)); err != nil {
 		return item, false, err
@@ -371,63 +385,68 @@ func (s *libraryStore) importOne(path string, m *manifest, destination string) (
 			return item, false, fmt.Errorf("expired capture is awaiting Trash cleanup; try again after cleanup succeeds")
 		}
 	}
-	info, err := s.preview(original, preview)
+	info, err := nativePreview(original, preview)
 	if err != nil {
 		return item, false, err
-	}
-	if !validMediaInfo(info) {
-		return item, false, fmt.Errorf("invalid media metadata")
 	}
 	if err := syncFile(preview); err != nil {
 		return item, false, err
 	}
-	idBytes := make([]byte, 16)
-	if _, err = rand.Read(idBytes); err != nil {
+	id, err := newLibraryID()
+	if err != nil {
 		return item, false, err
 	}
-	id := hex.EncodeToString(idBytes)
-	item = capture{ID: id, Kind: captureMedia, Filename: filepath.Base(path), Original: "originals/" + id + "." + info.Format,
-		Preview: "previews/" + id + ".png", MediaType: info.Type, Format: info.Format, Width: info.Width, Height: info.Height,
-		ImportedAt: s.now().UTC(), SHA256: digest}
+	item = capture{ID: id, Kind: captureMedia, Filename: filepath.Base(path), MediaType: info.Type, Format: info.Format,
+		Width: info.Width, Height: info.Height, ImportedAt: time.Now().UTC(), SHA256: digest}
+	item.setManagedPaths()
 	if destination != "" {
 		item.CollectionIDs = []string{destination}
 	}
-	originalDest, previewDest := filepath.Join(s.root, item.Original), filepath.Join(s.root, item.Preview)
-	committed, originalLinked, previewLinked := false, false, false
+	return item, false, s.installCapture(m, item, stage)
+}
+
+func (s *libraryStore) createManagedDirs() error {
+	for _, dir := range []string{originalsDir, previewsDir} {
+		if err := os.MkdirAll(filepath.Join(s.root, dir), 0755); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Caller holds the metadata lock. Each asset is already synced in staging.
+func (s *libraryStore) installCapture(m *manifest, item capture, stage string) error {
+	assets := item.assets()
+	linked := make([]string, 0, len(assets))
+	committed := false
 	defer func() {
 		if !committed {
-			if originalLinked {
-				os.Remove(originalDest)
-			}
-			if previewLinked {
-				os.Remove(previewDest)
+			for _, path := range linked {
+				_ = os.Remove(path)
 			}
 		}
 	}()
-	// Link fails if an internal name already exists; never clobber an original.
-	if err = os.Link(original, originalDest); err != nil {
-		return item, false, err
+	for _, asset := range assets {
+		dest := filepath.Join(s.root, asset.managed)
+		if err := os.Link(filepath.Join(stage, asset.staged), dest); err != nil {
+			return err
+		}
+		linked = append(linked, dest)
 	}
-	originalLinked = true
-	if err = os.Link(preview, previewDest); err != nil {
-		return item, false, err
-	}
-	previewLinked = true
-	if err = syncDirectory(filepath.Dir(originalDest)); err != nil {
-		return item, false, err
-	}
-	if err = syncDirectory(filepath.Dir(previewDest)); err != nil {
-		return item, false, err
+	for _, dir := range []string{originalsDir, previewsDir} {
+		if err := syncDirectory(filepath.Join(s.root, dir)); err != nil {
+			return err
+		}
 	}
 	updated := *m
 	updated.Items = append([]capture{item}, m.Items...)
 	sortCaptures(updated.Items)
-	if err = s.writeManifest(updated); err != nil {
-		return item, false, err
+	if err := s.writeManifest(updated); err != nil {
+		return err
 	}
 	committed = true
 	*m = updated
-	return item, false, nil
+	return nil
 }
 
 func copySynced(path string, r io.Reader) error {
@@ -475,5 +494,5 @@ func validCaptureInfo(item capture) bool {
 	if item.isLink() {
 		return validLinkCapture(item)
 	}
-	return (item.Kind == captureMedia || item.Kind == "") && item.URL == "" && item.Title == "" && item.Favicon == "" && item.QuickLook == "" && validMediaInfo(mediaInfo{item.MediaType, item.Format, item.Width, item.Height})
+	return (item.Kind == captureMedia || item.Kind == "") && item.URL == "" && item.Title == "" && validMediaInfo(mediaInfo{item.MediaType, item.Format, item.Width, item.Height})
 }

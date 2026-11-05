@@ -5,7 +5,7 @@ import (
 	"github.com/egoist/mygo"
 )
 
-// Mygo v0.6.4 creates its NSVisualEffectView with StateActive. Let AppKit
+// Mygo creates its sidebar NSVisualEffectView with StateActive. Let AppKit
 // follow window activation instead. Called on the main thread after creation;
 // Mygo still owns the effect, its material, placement, and lifetime.
 func followWindowActivity(win *mygo.Window) {

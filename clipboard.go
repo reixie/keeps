@@ -14,19 +14,22 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/transfer"
 	"golang.org/x/net/idna"
 )
 
 type pasteInput struct {
-	importInput
-	urls []string
+	paths    []string
+	urls     []string
+	failures []importFailure
+	cleanup  func()
 }
 
 // Prefer files per logical item, not globally. A missing/unreadable local
 // file remains a file failure; its raster alternative must not become a second
 // capture. No decoding, copying or filesystem work occurs during drag hover.
-func pastedInputs(data transfer.Data) (input pasteInput, err error) {
+func pastedInputs(data transfer.Data) (input pasteInput) {
 	var temp string
 	seen := map[string]bool{}
 	addURL := func(raw, label string, native bool) {
@@ -104,6 +107,7 @@ func pastedInputs(data transfer.Data) (input pasteInput, err error) {
 			continue
 		}
 		if temp == "" {
+			var err error
 			temp, err = os.MkdirTemp("", "keeps-paste-")
 			if err != nil {
 				input.failures = append(input.failures, importFailure{fmt.Sprintf("Clipboard image %d", i+1), err.Error()})
@@ -111,13 +115,13 @@ func pastedInputs(data transfer.Data) (input pasteInput, err error) {
 			}
 		}
 		path := filepath.Join(temp, fmt.Sprintf("Pasted image %s-%d.png", time.Now().Format("2006-01-02 15.04.05"), i+1))
-		if err = os.WriteFile(path, raw, 0600); err != nil {
+		if err := os.WriteFile(path, raw, 0600); err != nil {
 			input.failures = append(input.failures, importFailure{filepath.Base(path), err.Error()})
 			continue
 		}
 		input.paths = append(input.paths, path)
 	}
-	return input, nil
+	return input
 }
 
 // The Add Link dialog deliberately permits intranet hostnames. Clipboard text
@@ -175,31 +179,29 @@ func clearClipboardHost(host string) bool {
 }
 
 func (a *app) pasteMedia() {
-	if a.clipboardBlocked() || a.readClipboard == nil || a.loadError != nil || a.loading || a.store == nil {
+	if a.libraryInputBlocked() || a.loadError != nil || a.loading || a.store == nil {
 		return
 	}
 	// Read now, in response to this Paste. Mygo snapshots item boundaries and
 	// detects changes of ownership; queued work never rereads a different board.
 	destination := a.activeCollectionID()
-	data, err := a.readClipboard()
+	data, err := readCaptureClipboard()
 	if err != nil {
-		a.status = "Clipboard has no readable media or links"
-		a.announce(a.status)
+		a.announce("Clipboard has no readable media or links")
 		if !errors.Is(err, transfer.ErrFormat) {
-			a.report("Could not paste", err.Error())
+			a.report("Could not paste", err.Error(), "Copy readable media or HTTP/HTTPS links, then try Paste again.")
 		}
 		return
 	}
 	if len(data.Items()) == 0 {
-		a.status = "Clipboard has no media or links"
-		a.announce(a.status)
+		a.announce("Clipboard has no media or links")
 		return
 	}
 	a.pasteQueue = append(a.pasteQueue, pasteRequest{data: data, destination: destination})
 	a.startNextPaste()
 }
 
-func copyCaptures(root string, items []capture, raster func(string) ([]byte, error)) (transfer.Data, error) {
+func copyCaptures(root string, items []capture) (transfer.Data, error) {
 	var out []transfer.Item
 	for _, item := range items {
 		if item.isLink() {
@@ -229,7 +231,7 @@ func copyCaptures(root string, items []capture, raster func(string) ([]byte, err
 			reps = append(reps, transfer.Bytes(f, b))
 		}
 		if len(items) == 1 && item.MediaType == "image" {
-			raw, err := raster(path)
+			raw, err := originalPNG(path)
 			if err != nil {
 				return transfer.Data{}, err
 			}
@@ -242,31 +244,32 @@ func copyCaptures(root string, items []capture, raster func(string) ([]byte, err
 
 func (a *app) copySelected() {
 	a.copyGeneration++
-	if a.clipboardBlocked() || !a.captureSection() || a.store == nil || a.writeClipboard == nil {
+	if a.libraryInputBlocked() || !a.captureSection() || a.store == nil {
 		return
 	}
-	selected := a.orderedCopySelection()
+	selected := a.selection.orderedCopy(a.visibleItems())
 	if len(selected) == 0 {
 		return
 	} // In particular, never Write(empty).
 	generation, root := a.copyGeneration, a.store.root
-	raster, write := a.rasterOriginal, a.writeClipboard
 	go func() {
-		data, err := copyCaptures(root, selected, raster)
-		a.update(func() {
-			if generation != a.copyGeneration || a.clipboardBlocked() {
+		data, err := copyCaptures(root, selected)
+		a.window.Update(func() {
+			if generation != a.copyGeneration || a.libraryInputBlocked() {
 				return
 			}
 			if err == nil {
-				err = write(data)
+				err = mygo.Clipboard.Write(data)
+				if err == nil {
+					err = mygo.Clipboard.Flush()
+				}
 			}
 			if err != nil {
-				a.report("Could not copy", err.Error())
+				a.report("Could not copy", err.Error(), "Try Copy again. If it still fails, quit and reopen Keeps.")
 				a.announce("Could not copy")
 				return
 			}
-			a.status = fmt.Sprintf("%d copied", len(selected))
-			a.announce(a.status)
+			a.announce(fmt.Sprintf("%d copied", len(selected)))
 		})
 	}()
 }
