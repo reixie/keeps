@@ -24,7 +24,7 @@ type collectionDialogState struct {
 }
 
 func (a *app) openCollectionForm(existing *collection, ids []string, selectCreated bool) {
-	if a.collectionDialog != nil || a.linkDialog != nil || a.loading || a.loadError != nil || a.store == nil {
+	if a.switchingSpace || a.collectionDialog != nil || a.linkDialog != nil || a.loading || a.loadError != nil || a.store == nil {
 		return
 	}
 	f := &collectionForm{Icon: "folder"}
@@ -43,10 +43,11 @@ func (a *app) closeCollectionDialog(d *collectionDialogState) {
 	if a.focus == "" {
 		a.focus = focusLibrary
 	}
-	if a.navigation.hidden && (a.focus == focusNavigation || a.focus == "new-collection" || a.focus == focusAddCapture) {
+	if a.navigation.hidden && (a.focus == focusNavigation || a.focus == "new-collection" || a.focus == "empty-new-collection" || a.focus == focusAddCapture) {
 		a.focus = focusToggle
 	}
 	a.reconcileVisible(a.visibleItems())
+	a.window.Update(a.advanceSpaceSwitch)
 }
 
 func (a *app) submitCollectionForm(d *collectionDialogState) {
@@ -226,7 +227,7 @@ func (a *app) collectionRowMenu(id string, m *ui.Menu) {
 }
 
 func (a *app) confirmDeleteCollection(entry collection) {
-	if a.window == nil || a.collectionDialog != nil || a.linkDialog != nil {
+	if a.window == nil || a.switchingSpace || a.collectionDialog != nil || a.linkDialog != nil {
 		return
 	}
 	returnFocus := a.focus

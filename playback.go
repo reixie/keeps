@@ -140,7 +140,7 @@ func (a *app) previewTarget() (capture, bool) {
 }
 
 func (a *app) showPreview(item capture) {
-	if a.media == nil || a.closed || a.purging || a.linkDialog != nil || a.collectionDialog != nil {
+	if a.media == nil || a.closed || a.switchingSpace || a.purging || a.linkDialog != nil || a.collectionDialog != nil {
 		return
 	}
 	if !slices.ContainsFunc(a.visibleItems(), func(current capture) bool { return current.ID == item.ID }) {
@@ -170,6 +170,16 @@ func (m *mediaController) retainGIFs(visible map[string]bool) {
 		if !visible[id] {
 			delete(m.stillGIFs, id)
 		}
+	}
+}
+
+func (m *mediaController) resetForSpace() {
+	if m != nil {
+		m.releaseInline()
+		m.desired = nil
+		clear(m.stillGIFs)
+		m.backend.preview(nil, "")
+		m.previewOpen = false
 	}
 }
 

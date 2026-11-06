@@ -23,6 +23,10 @@ func (j libraryJob) discard() {
 }
 
 func (a *app) enqueueLibraryJob(job libraryJob) {
+	if a.switchingSpace {
+		job.discard()
+		return
+	}
 	if a.closed || a.loadError != nil {
 		job.discard()
 		if !a.closed {
@@ -53,6 +57,7 @@ func (a *app) startNextLibraryJob() {
 			}
 			a.libraryJobRunning = false
 			a.startNextLibraryJob()
+			a.advanceSpaceSwitch()
 		})
 	}()
 }
@@ -85,7 +90,7 @@ func (a *app) submitPrepared(ctx context.Context, job libraryJob, accept func(li
 }
 
 func (a *app) addCapture() {
-	if a.closed || a.collectionDialog != nil || a.linkDialog != nil || a.picking || a.loading || a.store == nil || a.loadError != nil {
+	if a.closed || a.switchingSpace || a.collectionDialog != nil || a.linkDialog != nil || a.picking || a.loading || a.store == nil || a.loadError != nil {
 		return
 	}
 	a.captureMenu.dismiss()
@@ -115,7 +120,7 @@ func (a *app) addCapture() {
 }
 
 func (a *app) dropFiles(paths []string) {
-	if len(paths) == 0 || a.collectionDialog != nil || a.linkDialog != nil {
+	if len(paths) == 0 || a.switchingSpace || a.collectionDialog != nil || a.linkDialog != nil {
 		return
 	}
 	paths = slices.Clone(paths)
@@ -129,7 +134,7 @@ func (a *app) importMedia(store *libraryStore, paths []string, destination strin
 	result := store.importFiles(paths, destination)
 	return func() {
 		if len(paths) > 0 && result.Fatal == nil {
-			a.publishSnapshot(manifest{Items: result.Items, Collections: result.Collections})
+			a.publishSnapshot(result.Snapshot)
 		}
 		if result.Added > 0 {
 			if destination == "" {
@@ -150,7 +155,7 @@ func (a *app) linkJob(prepared *preparedLink, destination string, finish func(im
 		result := store.saveLink(prepared, destination)
 		return func() {
 			if result.Fatal == nil {
-				a.publishSnapshot(manifest{Items: result.Items, Collections: result.Collections})
+				a.publishSnapshot(result.Snapshot)
 			}
 			finish(result)
 		}

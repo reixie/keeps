@@ -10,7 +10,7 @@ esac
 minimum_os="$(/usr/bin/plutil -extract macos.minimumSystemVersion raw -o - mygo.json)"
 swift_flags=(-O -module-cache-path "${TMPDIR:-/tmp}/keeps-swift-module-cache" -target "$swift_arch-apple-macosx$minimum_os")
 media_sources=(native/media.swift)
-playback_sources=(native/playback.swift native/capture_menu.swift)
+playback_sources=(native/playback.swift native/capture_menu.swift native/library_controls.swift native/space_symbol.swift native/tags_popover.swift native/settings.swift)
 
 needs_build() {
   local output="$1" source

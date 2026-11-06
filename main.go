@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"os"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -57,6 +58,23 @@ type app struct {
 	reduceMotion             bool
 	media                    *mediaController
 	purging                  bool
+	preferences              appPreferences
+	preferencesError         error
+	libraryOverride          bool
+	defaultRoot              string
+	pendingSpace             *spaceRequest
+	switchingSpace           bool
+	spaceGeneration          uint64
+	tags                     []libraryTag
+	tagEditor                *tagEditorState
+	filters                  captureFilters
+	browse                   browseState
+	controls                 *nativeLibraryControls
+	settingsSpaceID          string
+	settingsSpaceError       string
+	checkingUpdates          bool
+	updateStatus             string
+	releaseURL               string
 }
 
 func (a *app) view(c *ui.Context) {
@@ -79,7 +97,7 @@ func (a *app) view(c *ui.Context) {
 	c.SetTheme(&widgetTheme)
 	c.Root().Background(ui.Transparent)
 	background := ui.Transparent
-	if a.reduceTransparency || !c.Vibrancy() {
+	if !a.preferences.Translucent || a.reduceTransparency || !c.Vibrancy() {
 		background = t.BackgroundTranslucent
 	}
 	ui.Row(c).Fill().AlignItems(ui.Stretch).Background(background).Children(func() {
@@ -102,6 +120,9 @@ func (a *app) view(c *ui.Context) {
 		ui.Box(c).Absolute().Left(toggleX + sidebarControlSize).Top(0).Width(sidebarWidth - toggleX - sidebarControlSize).Height(dragHeight).DragWindow()
 	}
 	if !a.navigation.hidden {
+		ui.Box(c).Absolute().Left(controlsLeft).Top(sidebarControlTop).
+			Size(2*sidebarControlSize+sidebarControlGap, sidebarControlSize).Radius(sidebarControlSize / 2).
+			Background(t.Hover)
 		a.sidebarAddCapture(c, t, controlsLeft)
 	}
 	a.sidebarToggle(c, t, toggleX)
@@ -115,8 +136,10 @@ func (a *app) view(c *ui.Context) {
 func main() {
 	a := newApp()
 	mygo.App.SetName("Keeps")
-	mygo.Theme.SetSource(mygo.ThemeSystem)
 	mygo.App.WhenReady(func() {
+		a.libraryOverride = os.Getenv("KEEPS_LIBRARY") != ""
+		a.preferences, a.preferencesError = loadPreferences()
+		mygo.Theme.SetSource(a.preferences.Appearance)
 		a.reduceTransparency = mygo.Theme.Preferences().ReduceTransparency
 		a.reduceMotion = mygo.Theme.Preferences().ReduceMotion
 		work := mygo.Screen.PrimaryDisplay().WorkArea
@@ -147,6 +170,14 @@ func main() {
 			log.Printf("Native capture menu unavailable: %v", err)
 		}
 		a.captureMenu = menu
+		controls, err := newLibraryControls(win.NativeHandle(), a.nativeControlAction)
+		if err != nil {
+			log.Printf("Native library controls unavailable: %v", err)
+		}
+		a.controls = controls
+		if a.preferencesError != nil {
+			a.report("Could not load settings", a.preferencesError.Error(), "")
+		}
 		if backend, err := newMacPlayback(win.NativeHandle()); err != nil {
 			log.Printf("Native playback unavailable: %v", err)
 			const title = "Native viewing could not start"

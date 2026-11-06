@@ -51,10 +51,9 @@ func (s *libraryStore) setTrashedSnapshot(ids []string, restore bool) (manifest,
 }
 
 type purgeResult struct {
-	Items       []capture
-	Collections []collection
-	Publish     bool // intent may commit even when subsequent deletion fails
-	Err         error
+	Snapshot manifest
+	Publish  bool // intent may commit even when subsequent deletion fails
+	Err      error
 }
 
 // cleanupExpired is called only by the serial mutation worker. The same flock
@@ -129,7 +128,7 @@ func (s *libraryStore) purgeCaptures(ids []string, beforeUnlink func(manifest) e
 			return
 		}
 	}
-	result.Items, result.Collections, result.Publish = m.Items, m.Collections, true
+	result.Snapshot, result.Publish = m, true
 	if len(m.PendingPurges) == 0 {
 		return
 	}
@@ -234,7 +233,7 @@ func (a *app) enqueueTrash(op trashOperation) {
 const deleteRecovery = "Check library permissions and try again from Trash."
 
 func (a *app) confirmDeletePermanently(ids []string) {
-	if a.closed || a.store == nil || a.loadError != nil || a.nativeDialogs > 0 || a.collectionDialog != nil || a.linkDialog != nil || len(ids) == 0 {
+	if a.closed || a.switchingSpace || a.store == nil || a.loadError != nil || a.nativeDialogs > 0 || a.collectionDialog != nil || a.linkDialog != nil || len(ids) == 0 {
 		return
 	}
 	ids = slices.Clone(ids)
@@ -290,7 +289,7 @@ func (a *app) enqueuePermanentDeletion(ids []string) {
 }
 
 func (a *app) requestCleanup() {
-	if a.closed || a.loading || a.store == nil || a.loadError != nil || a.cleanupQueued {
+	if a.closed || a.switchingSpace || a.loading || a.store == nil || a.loadError != nil || a.cleanupQueued {
 		return
 	}
 	a.cleanupQueued = true
@@ -316,7 +315,7 @@ func (a *app) requestCleanup() {
 func (a *app) finishPurge(result purgeResult) {
 	a.purging = false
 	if result.Publish {
-		a.publishSnapshot(manifest{Items: result.Items, Collections: result.Collections})
+		a.publishSnapshot(result.Snapshot)
 	}
 }
 

@@ -34,5 +34,4 @@ func (a *app) startRetention() {
 	stop := scheduleRetention(ticker.C, request)
 	off := mygo.Power.OnResume(request)
 	a.stopRetention = func() { off(); ticker.Stop(); stop() }
-	a.requestCleanup()
 }

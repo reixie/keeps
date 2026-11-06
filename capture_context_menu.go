@@ -16,6 +16,7 @@ type captureMenuSnapshot struct {
 	restore      bool
 	collectionID string
 	collections  []collectionMenuEntry
+	tags         []collectionMenuEntry
 }
 
 type collectionMenuEntry struct {
@@ -52,6 +53,15 @@ func (a *app) prepareCaptureContextMenu(id string) {
 	menu.openLink = len(selected) == 1 && selected[0].isLink()
 	if !menu.restore {
 		menu.collections = freezeCollectionMenu(a.collections, selected)
+		for _, tag := range a.tags {
+			count := 0
+			for _, item := range selected {
+				if slices.Contains(item.TagIDs, tag.ID) {
+					count++
+				}
+			}
+			menu.tags = append(menu.tags, membershipMenuEntry(tag.ID, tag.Name, count, len(selected)))
+		}
 	}
 	a.cardMenu = menu
 }
@@ -65,21 +75,22 @@ func freezeCollectionMenu(collections []collection, selected []capture) []collec
 				count++
 			}
 		}
-		all := len(selected) > 0 && count == len(selected)
-		label := entry.Name
-		// Mygo's native MenuItem exposes a boolean check mark. Keep partial
-		// membership explicit in the label rather than displaying it as all.
-		if count > 0 && !all {
-			label += " (Some Selected)"
-		}
-		entries = append(entries, collectionMenuEntry{ID: entry.ID, Label: label, Checked: all})
+		entries = append(entries, membershipMenuEntry(entry.ID, entry.Name, count, len(selected)))
 	}
 	return entries
 }
 
+func membershipMenuEntry(id, name string, count, total int) collectionMenuEntry {
+	all := total > 0 && count == total
+	if count > 0 && !all {
+		name += " (Some Selected)"
+	}
+	return collectionMenuEntry{ID: id, Label: name, Checked: all}
+}
+
 func (a *app) captureContextMenu(id string, m *ui.Menu) {
 	menu := a.cardMenu
-	if menu == nil || menu.triggerID != id || len(menu.ids) == 0 {
+	if a.switchingSpace || menu == nil || menu.triggerID != id || len(menu.ids) == 0 {
 		return
 	}
 	if action := a.captureMenuAction(m, menu); action != nil {
@@ -123,6 +134,35 @@ func (a *app) captureMenuAction(m *ui.Menu, menu *captureMenuSnapshot) func() {
 	m.Separator()
 	if action := a.captureCollectionAction(m, menu); action != nil {
 		return action
+	}
+	var tagAction func()
+	m.Submenu("Tags", func(sub *ui.Menu) {
+		for _, entry := range menu.tags {
+			if sub.Item(entry.Label).Checked(entry.Checked).Chosen() {
+				tagAction = func() {
+					a.changeTags("Could not update tags", func(store *libraryStore) (manifest, error) {
+						return store.assignTag(menu.ids, entry.ID, !entry.Checked)
+					})
+				}
+				return
+			}
+		}
+		if len(menu.tags) > 0 {
+			sub.Separator()
+		}
+		if sub.Item("New Tag…").Disabled(a.controls == nil).Chosen() {
+			tagAction = func() {
+				generation := a.spaceGeneration
+				a.window.Update(func() {
+					if a.spaceGeneration == generation {
+						a.openTagEditor(libraryTag{}, menu.ids)
+					}
+				})
+			}
+		}
+	})
+	if tagAction != nil {
+		return tagAction
 	}
 	if menu.collectionID != "" && m.Item("Remove from This Collection").Chosen() {
 		return func() {

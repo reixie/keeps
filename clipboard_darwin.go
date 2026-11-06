@@ -33,7 +33,7 @@ func readCaptureClipboard() (transfer.Data, error) {
 	for _, item := range clipboardArray(board.Send(objc.RegisterName("pasteboardItems"))) {
 		available := map[string]bool{}
 		for _, typ := range clipboardArray(item.Send(objc.RegisterName("types"))) {
-			available[clipboardString(typ)] = true
+			available[nativeString(typ)] = true
 		}
 		var reps []transfer.Representation
 		for _, group := range []struct {
@@ -80,31 +80,12 @@ func clipboardArray(array objc.ID) []objc.ID {
 	return items
 }
 
-func clipboardNSString(s string) objc.ID {
-	return objc.ID(objc.GetClass("NSString")).Send(objc.RegisterName("stringWithUTF8String:"), s)
-}
-
-func clipboardString(s objc.ID) string {
-	if s == 0 {
-		return ""
-	}
-	n := uintptr(s.Send(objc.RegisterName("lengthOfBytesUsingEncoding:"), uintptr(4))) // NSUTF8StringEncoding
-	if n == 0 || n > 64<<20 {
-		return ""
-	}
-	p := objc.Send[unsafe.Pointer](s, objc.RegisterName("UTF8String"))
-	if p == nil {
-		return ""
-	}
-	return string(unsafe.Slice((*byte)(p), int(n)))
-}
-
 func clipboardRepresentation(item objc.ID, name string, format transfer.Format) ([]byte, error) {
-	typ := clipboardNSString(name)
+	typ := nativeNSString(name)
 	if name == "NSFilenamesPboardType" {
 		var paths []string
 		for _, value := range clipboardArray(item.Send(objc.RegisterName("propertyListForType:"), typ)) {
-			paths = append(paths, clipboardString(value))
+			paths = append(paths, nativeString(value))
 		}
 		files, err := transfer.FileData(paths...)
 		if err != nil {
@@ -124,7 +105,7 @@ func clipboardRepresentation(item objc.ID, name string, format transfer.Format) 
 		if text == 0 || uintptr(text.Send(objc.RegisterName("lengthOfBytesUsingEncoding:"), uintptr(4))) > 64<<20 {
 			return nil, fmt.Errorf("Clipboard text is unreadable or too large. Copy the addresses again.")
 		}
-		return []byte(clipboardString(text)), nil
+		return []byte(nativeString(text)), nil
 	}
 	if name == "public.tiff" {
 		image := objc.ID(objc.GetClass("NSBitmapImageRep")).Send(objc.RegisterName("imageRepWithData:"), data)
@@ -152,8 +133,8 @@ func clipboardRepresentation(item objc.ID, name string, format transfer.Format) 
 	if name == "public.file-url" {
 		value := strings.TrimRight(string(raw), "\x00")
 		if strings.HasPrefix(value, "file:///.file/") {
-			u := objc.ID(objc.GetClass("NSURL")).Send(objc.RegisterName("URLWithString:"), clipboardNSString(value))
-			if resolved := clipboardString(u.Send(objc.RegisterName("filePathURL")).Send(objc.RegisterName("absoluteString"))); resolved != "" {
+			u := objc.ID(objc.GetClass("NSURL")).Send(objc.RegisterName("URLWithString:"), nativeNSString(value))
+			if resolved := nativeString(u.Send(objc.RegisterName("filePathURL")).Send(objc.RegisterName("absoluteString"))); resolved != "" {
 				raw = []byte(resolved)
 			}
 		}

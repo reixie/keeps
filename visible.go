@@ -3,16 +3,18 @@ package main
 import (
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 )
 
 type captureGrid struct {
-	scroll      ui.ScrollState
-	layout      masonryLayout
-	layoutWidth float32
-	layoutItems []capture
-	revealFocus bool
+	scroll        ui.ScrollState
+	layout        masonryLayout
+	layoutWidth   float32
+	layoutMinimum float32
+	layoutItems   []capture
+	revealFocus   bool
 }
 
 func (a *app) captureSection() bool {
@@ -22,20 +24,39 @@ func (a *app) captureSection() bool {
 // This ordered sequence drives geometry, focus, selection, clipboard and menus.
 // Filtering preserves the store's newest-first order.
 func (a *app) visibleItems() []capture {
+	since := a.filters.since(time.Now())
+	key := browseKey{section: a.navigation.selected, query: a.browse.query, sort: a.preferences.Sort, filters: a.filters, since: since}
+	if a.browse.valid && a.browse.key == key {
+		return a.browse.items
+	}
+	words := strings.Fields(tagNameKey(key.query))
+	var names map[string]string
+	if len(words) > 0 {
+		names = make(map[string]string, len(a.tags))
+		for _, tag := range a.tags {
+			names[tag.ID] = tagNameKey(tag.Name)
+		}
+	}
 	var items []capture
 	for _, item := range a.items {
-		if itemInSection(item, a.navigation.selected) {
+		if itemInSection(item, key.section) && a.filters.matches(item, since) && matchesSearch(item, words, names) {
 			items = append(items, item)
 		}
 	}
-	if a.navigation.selected == sectionTrash {
+	switch {
+	case key.section == sectionTrash:
 		slices.SortStableFunc(items, func(a, b capture) int {
 			if n := b.TrashedAt.Compare(*a.TrashedAt); n != 0 {
 				return n
 			}
 			return strings.Compare(a.ID, b.ID)
 		})
+	case key.sort == "oldest":
+		slices.SortStableFunc(items, func(a, b capture) int { return a.ImportedAt.Compare(b.ImportedAt) })
+	case key.sort == "name":
+		slices.SortStableFunc(items, func(a, b capture) int { return strings.Compare(browseName(a), browseName(b)) })
 	}
+	a.browse.key, a.browse.items, a.browse.valid = key, items, true
 	return items
 }
 
@@ -106,12 +127,12 @@ func (g *captureGrid) reset() {
 	g.layout, g.layoutItems = masonryLayout{}, nil
 }
 
-func (g *captureGrid) updateLayout(items []capture, width, viewportHeight float32, focus string) {
-	if g.layoutWidth != width || !slices.EqualFunc(g.layoutItems, items, func(a, b capture) bool {
+func (g *captureGrid) updateLayout(items []capture, width, viewportHeight, minimum float32, focus string) {
+	if g.layoutWidth != width || g.layoutMinimum != minimum || !slices.EqualFunc(g.layoutItems, items, func(a, b capture) bool {
 		return a.ID == b.ID && a.Kind == b.Kind && a.Width == b.Width && a.Height == b.Height
 	}) {
-		g.layout = layoutMasonry(items, width)
-		g.layoutWidth, g.layoutItems = width, slices.Clone(items)
+		g.layout = layoutMasonry(items, width, minimum)
+		g.layoutWidth, g.layoutMinimum, g.layoutItems = width, minimum, slices.Clone(items)
 	}
 	g.scroll.Y = min(g.scroll.Y, max(0, g.layout.Height-viewportHeight))
 	if g.revealFocus {

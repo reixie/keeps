@@ -37,6 +37,7 @@ func (a *app) startNextPaste() {
 				a.announce(fmt.Sprintf("%d added, %d already saved", result.Added, result.Duplicates))
 			}
 			a.startNextPaste()
+			a.advanceSpaceSwitch()
 		})
 	}()
 }

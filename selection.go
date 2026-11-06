@@ -68,7 +68,7 @@ func (a *app) restoreCaptureFocus(previous string) {
 }
 
 func (a *app) libraryInputBlocked() bool {
-	return a.closed || a.picking || a.nativeDialogs > 0 || a.collectionDialog != nil || a.linkDialog != nil || a.previewOwnsFocus()
+	return a.closed || a.switchingSpace || a.picking || a.nativeDialogs > 0 || a.collectionDialog != nil || a.linkDialog != nil || a.tagEditor != nil || a.previewOwnsFocus()
 }
 
 // Focused text widgets handle their own InputCommand. These handlers are

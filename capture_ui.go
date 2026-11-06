@@ -9,7 +9,7 @@ import (
 )
 
 func (a *app) openCapture(item capture) {
-	if a.linkDialog != nil || a.collectionDialog != nil || a.purging {
+	if a.switchingSpace || a.linkDialog != nil || a.collectionDialog != nil || a.purging {
 		return
 	}
 	if item.isLink() {
@@ -44,7 +44,24 @@ func (a *app) libraryView(c *ui.Context, t themeValues) {
 		width -= sidebarWidth
 	}
 	width -= 2 * panelBorderWidth
-	viewportHeight := max(0, height-2*contentPadding-headerHeight-2*panelBorderWidth)
+	top := headerHeight
+	if a.hasBrowseConditions() {
+		top += browseBarHeight
+	}
+	var selected *capture
+	if len(a.selection.order) == 1 {
+		for i := range items {
+			if a.selection.has(items[i].ID) {
+				selected = &items[i]
+				break
+			}
+		}
+	}
+	viewportHeight := height - 2*contentPadding - top - 2*panelBorderWidth
+	if len(items) > 0 {
+		viewportHeight -= browseBarHeight
+	}
+	viewportHeight = max(0, viewportHeight)
 	panel := ui.Column(c).Fill().Background(t.BackgroundPrimary).Radius(panelRadius).Border(panelBorderWidth, t.Border).Label("Main content").Clip().
 		FocusBind(&a.focus, focusLibrary).HandleInput(func(ev ui.InputEvent) bool {
 		if ev.Kind == ui.InputPointerDown && ev.Button == 0 {
@@ -61,7 +78,7 @@ func (a *app) libraryView(c *ui.Context, t themeValues) {
 	panel.Children(func() {
 		defer func() {
 			if over {
-				ui.Box(c).Absolute().Left(8).Right(8).Top(headerHeight).Bottom(8).Radius(8).
+				ui.Box(c).Absolute().Left(8).Right(8).Top(top).Bottom(8).Radius(8).
 					Background(t.Selected.Alpha(0.8)).Children(func() {
 					ui.Text(c, "Drop to add").Absolute().Left(16).Top(16).Padding(8, 12).
 						Radius(8).Background(t.BackgroundPrimary).TextColor(t.TextPrimary).FontSize(13)
@@ -69,6 +86,14 @@ func (a *app) libraryView(c *ui.Context, t themeValues) {
 			}
 		}()
 		a.header(c, t)
+		if a.hasBrowseConditions() {
+			ui.Row(c).Key("browse-conditions").Height(browseBarHeight).Shrink(0).Padding(0, headerPadding).
+				Gap(8).AlignItems(ui.Center).Background(t.BackgroundSecondary).Children(func() {
+				conditions := a.browseConditions()
+				ui.Text(c, conditions).SingleLine().Grow(1).MinWidth(0).TextColor(t.TextSecondary).Tooltip(conditions)
+				a.browseButton(c, t, "clear-browse", "Clear All").OnClick(func() { a.window.Update(a.clearBrowse) })
+			})
+		}
 		if !a.captureSection() {
 			return
 		}
@@ -82,6 +107,9 @@ func (a *app) libraryView(c *ui.Context, t themeValues) {
 				if a.navigation.selected == sectionTrash {
 					title, detail = "Trash is empty.", ""
 				}
+				if a.hasBrowseConditions() {
+					title = "No matching captures"
+				}
 				if a.loading {
 					title, detail = "Loading library…", ""
 				}
@@ -92,10 +120,17 @@ func (a *app) libraryView(c *ui.Context, t themeValues) {
 				if detail != "" {
 					ui.Text(c, detail).FontSize(12).FixedLineHeight(17).TextColor(t.TextTertiary).MaxWidth(max(100, width-64)).TextAlign(ui.Center)
 				}
+				if !a.loading && !a.switchingSpace && a.loadError == nil && a.store != nil {
+					if a.hasBrowseConditions() {
+						a.browseButton(c, t, "clear-empty-browse", "Clear Search and Filters").OnClick(func() { a.window.Update(a.clearBrowse) })
+					} else if a.navigation.selected == sectionLibrary || a.activeCollectionID() != "" {
+						a.browseButton(c, t, "empty-import", "Import Media…").OnClick(func() { a.window.Update(a.addCapture) })
+					}
+				}
 			})
 			return
 		}
-		a.grid.updateLayout(items, width, viewportHeight, a.focus)
+		a.grid.updateLayout(items, width, viewportHeight, a.browseMinimum(), a.focus)
 		if a.media != nil {
 			a.media.desired = playbackCandidates(items, a.grid.layout, a.grid.scroll.Y, viewportHeight, a.media.stillGIFs)
 		}
@@ -112,6 +147,18 @@ func (a *app) libraryView(c *ui.Context, t themeValues) {
 				}
 			})
 		})
+		if selected != nil {
+			a.tagBar(c, t, *selected)
+		} else {
+			ui.Row(c).Key("capture-count").Height(browseBarHeight).Shrink(0).Padding(0, headerPadding).
+				AlignItems(ui.Center).Background(t.BackgroundSecondary).Children(func() {
+				label := fmt.Sprintf("%d %s", len(items), captureNoun(len(items)))
+				if count := len(a.selection.order); count > 1 {
+					label = fmt.Sprintf("%d selected", count)
+				}
+				ui.Text(c, label).FontSize(12).TextColor(t.TextSecondary)
+			})
+		}
 	})
 }
 
@@ -135,7 +182,7 @@ func (a *app) captureCard(c *ui.Context, t themeValues, item capture, index int,
 		card.Background(t.Selected)
 	}
 	card.HandleInput(func(ev ui.InputEvent) bool {
-		if a.collectionDialog != nil || a.linkDialog != nil || a.previewOwnsFocus() {
+		if a.switchingSpace || a.collectionDialog != nil || a.linkDialog != nil || a.previewOwnsFocus() {
 			return false
 		}
 		if contextInvocation(ev) {

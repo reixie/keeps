@@ -2,6 +2,7 @@ package main
 
 import (
 	"slices"
+	"strings"
 
 	"github.com/egoist/mygo"
 )
@@ -10,11 +11,19 @@ const libraryLoadRecovery = "Quit and reopen Keeps to try again."
 
 func (a *app) startLibrary() {
 	a.loading = true
+	space := a.preferences.activeSpace()
+	if a.libraryOverride {
+		space = defaultPreferences().Spaces[0]
+	}
 	go func() {
-		root, err := defaultLibraryRoot()
+		defaultRoot, defaultErr := defaultLibraryRoot()
+		var store *libraryStore
 		var snapshot manifest
-		store := &libraryStore{root: root}
-		if err == nil {
+		err := defaultErr
+		if space.Root != "" {
+			store, snapshot, err = loadSpace(space)
+		} else if err == nil {
+			store = &libraryStore{root: defaultRoot}
 			snapshot, err = store.loadSnapshot()
 		}
 		a.window.Update(func() {
@@ -22,6 +31,8 @@ func (a *app) startLibrary() {
 				return
 			}
 			a.loading = false
+			a.defaultRoot = defaultRoot
+			a.refreshSettings()
 			a.loadError = err
 			if err != nil {
 				const title = "Library could not be loaded"
@@ -30,14 +41,20 @@ func (a *app) startLibrary() {
 				a.discardLibraryJobs()
 				return
 			}
-			a.store = store
-			a.publishSnapshot(snapshot)
-			a.thumbnails = newThumbnailCache(store, a.window.Update)
-			a.startRetention()
-			a.startNextLibraryJob()
-			a.startNextPaste()
+			a.installLibrary(store, snapshot)
+			a.advanceSpaceSwitch()
 		})
 	}()
+}
+
+func (a *app) installLibrary(store *libraryStore, snapshot manifest) {
+	a.store = store
+	a.publishSnapshot(snapshot)
+	a.thumbnails = newThumbnailCache(store, a.window.Update)
+	a.startRetention()
+	a.requestCleanup()
+	a.startNextLibraryJob()
+	a.startNextPaste()
 }
 
 func (a *app) shutdown() {
@@ -47,6 +64,8 @@ func (a *app) shutdown() {
 	a.closed = true
 	a.captureMenu.dispose()
 	a.captureMenu = nil
+	a.controls.dispose()
+	a.controls = nil
 	if a.pasteCancel != nil {
 		a.pasteCancel()
 	}
@@ -71,7 +90,22 @@ func (a *app) publishSnapshot(snapshot manifest) {
 		a.focus = focusLibrary
 	}
 	previous := a.visibleItems()
+	a.browse.valid = false
 	a.items = snapshot.Items
+	tags := slices.Clone(snapshot.Tags)
+	slices.SortFunc(tags, func(a, b libraryTag) int {
+		return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
+	})
+	if !slices.Equal(tags, a.tags) {
+		a.tags = tags
+		a.controls.update(controlTags, tags)
+	}
+	if a.filters.collection != "" && !hasCollection(a.collections, a.filters.collection) {
+		a.filters.collection = ""
+	}
+	if a.filters.tag != "" && !hasTag(a.tags, a.filters.tag) {
+		a.filters.tag = ""
+	}
 	current := a.visibleItems()
 	visible := make(map[string]bool, len(current))
 	for _, item := range current {
@@ -98,6 +132,7 @@ func (a *app) nativeMessage(options mygo.MessageOptions, complete func(mygo.Mess
 			if complete != nil && !a.closed {
 				complete(result, err)
 			}
+			a.advanceSpaceSwitch()
 		})
 	}()
 }

@@ -7,8 +7,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"unsafe"
 
 	"github.com/ebitengine/purego"
+	"github.com/ebitengine/purego/objc"
 	"github.com/egoist/mygo"
 )
 
@@ -48,4 +50,23 @@ func bindKeepsNative(symbols map[string]any) error {
 		purego.RegisterFunc(fn, address)
 	}
 	return nil
+}
+
+func nativeNSString(s string) objc.ID {
+	return objc.ID(objc.GetClass("NSString")).Send(objc.RegisterName("stringWithUTF8String:"), s)
+}
+
+func nativeString(s objc.ID) string {
+	if s == 0 {
+		return ""
+	}
+	n := uintptr(s.Send(objc.RegisterName("lengthOfBytesUsingEncoding:"), uintptr(4))) // NSUTF8StringEncoding
+	if n == 0 || n > 64<<20 {
+		return ""
+	}
+	p := objc.Send[unsafe.Pointer](s, objc.RegisterName("UTF8String"))
+	if p == nil {
+		return ""
+	}
+	return string(unsafe.Slice((*byte)(p), int(n)))
 }

@@ -14,7 +14,7 @@ type linkDialogState struct {
 }
 
 func (a *app) addLink() {
-	if a.closed || a.collectionDialog != nil || a.linkDialog != nil || a.picking || a.loading || a.store == nil || a.loadError != nil {
+	if a.closed || a.switchingSpace || a.collectionDialog != nil || a.linkDialog != nil || a.picking || a.loading || a.store == nil || a.loadError != nil {
 		return
 	}
 	a.captureMenu.dismiss()
@@ -31,6 +31,7 @@ func (a *app) closeLinkDialog(d *linkDialogState) {
 	a.linkDialog = nil
 	a.restoreCaptureFocus(d.ReturnFocus)
 	a.reconcileVisible(a.visibleItems())
+	a.window.Update(a.advanceSpaceSwitch)
 }
 func (a *app) submitLink(d *linkDialogState) {
 	if a.linkDialog != d || d.Preparing || d.Saving {

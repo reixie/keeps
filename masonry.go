@@ -16,9 +16,9 @@ type masonryLayout struct {
 	Height float32
 }
 
-func layoutMasonry(items []capture, width float32) masonryLayout {
+func layoutMasonry(items []capture, width, minimum float32) masonryLayout {
 	inner := max(0, width-2*masonryPadding)
-	n := max(1, int(math.Floor(float64((inner+masonryGap)/(masonryMinimum+masonryGap)))))
+	n := max(1, int(math.Floor(float64((inner+masonryGap)/(minimum+masonryGap)))))
 	w := max(0, (inner-float32(n-1)*masonryGap)/float32(n))
 	bottom := make([]float32, n)
 	for i := range bottom {

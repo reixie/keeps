@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const manifestVersion = 4
+const manifestVersion = 5
 
 const (
 	captureMedia = "media"
@@ -58,6 +58,7 @@ type capture struct {
 	Starred       bool       `json:"starred"`
 	TrashedAt     *time.Time `json:"trashed_at,omitempty"`
 	CollectionIDs []string   `json:"collection_ids,omitempty"`
+	TagIDs        []string   `json:"tag_ids,omitempty"`
 }
 
 func (c capture) isLink() bool { return c.Kind == captureLink }
@@ -96,6 +97,7 @@ type manifest struct {
 	Items         []capture    `json:"items"`
 	PendingPurges []capture    `json:"pending_purges,omitempty"`
 	Collections   []collection `json:"collections"`
+	Tags          []libraryTag `json:"tags,omitempty"`
 }
 
 type libraryStore struct {
@@ -144,7 +146,7 @@ func (s *libraryStore) readManifest() (manifest, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return manifest{}, fmt.Errorf("read library manifest: %w", err)
 	}
-	if m.Version != 1 && m.Version != 2 && m.Version != 3 && m.Version != manifestVersion {
+	if m.Version != 1 && m.Version != 2 && m.Version != 3 && m.Version != 4 && m.Version != manifestVersion {
 		return manifest{}, fmt.Errorf("unsupported library version %d", m.Version)
 	}
 	if m.Version == 1 && len(m.PendingPurges) > 0 {
@@ -166,6 +168,17 @@ func (s *libraryStore) readManifest() (manifest, error) {
 				item.URL, item.Title, item.Favicon, item.QuickLook = "", "", "", ""
 			}
 		}
+	}
+	if m.Version < 5 {
+		m.Tags = nil
+		for _, items := range [][]capture{m.Items, m.PendingPurges} {
+			for i := range items {
+				items[i].TagIDs = nil
+			}
+		}
+	}
+	if err := validateTagMetadata(m); err != nil {
+		return manifest{}, err
 	}
 	if err := validateCollectionMetadata(m); err != nil {
 		return manifest{}, err
@@ -220,11 +233,10 @@ func sortCaptures(items []capture) {
 type importFailure struct{ Filename, Reason string }
 type importResult struct {
 	Fatal              error
-	Items              []capture
+	Snapshot           manifest
 	Added, Duplicates  int
 	InTrash            int
 	Failures           []importFailure
-	Collections        []collection
 	DestinationMissing bool
 }
 
@@ -252,7 +264,7 @@ func (s *libraryStore) importFiles(paths []string, destination string) (result i
 	if err != nil {
 		return failAll(err)
 	}
-	result.Items, result.Collections = m.Items, m.Collections
+	result.Snapshot = m
 	if destination != "" && !hasCollection(m.Collections, destination) {
 		result.DestinationMissing = true
 		destination = ""
@@ -274,8 +286,8 @@ func (s *libraryStore) importFiles(paths []string, destination string) (result i
 			result.Added++
 		}
 	}
-	result.Items, result.Collections = m.Items, m.Collections
-	sortCaptures(result.Items)
+	result.Snapshot = m
+	sortCaptures(result.Snapshot.Items)
 	return
 }
 

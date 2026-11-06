@@ -368,7 +368,7 @@ func (s *libraryStore) saveLink(p *preparedLink, destination string) (result imp
 		destination = ""
 		result.DestinationMissing = true
 	}
-	result.Items, result.Collections = m.Items, m.Collections
+	result.Snapshot = m
 	for _, old := range m.PendingPurges {
 		if old.isLink() && old.URL == p.item.URL {
 			return fail(fmt.Errorf("This link is awaiting Trash cleanup. Try again after cleanup finishes."))
@@ -386,7 +386,7 @@ func (s *libraryStore) saveLink(p *preparedLink, destination string) (result imp
 				}
 			}
 			result.Duplicates = 1
-			result.Items = m.Items
+			result.Snapshot = m
 			return result
 		}
 	}
@@ -401,6 +401,6 @@ func (s *libraryStore) saveLink(p *preparedLink, destination string) (result imp
 	if err = s.installCapture(&m, item, p.stage); err != nil {
 		return fail(err)
 	}
-	result.Items, result.Collections, result.Added = m.Items, m.Collections, 1
+	result.Snapshot, result.Added = m, 1
 	return result
 }
