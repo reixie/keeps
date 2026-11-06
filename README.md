@@ -9,6 +9,8 @@ adapters for macOS media handling and Quick Look.
 
 <img width="2624" height="1824" alt="image" src="https://github.com/user-attachments/assets/a2b9121e-2644-4235-8ce4-320be7eeac03" />
 
+[![Listed on Awesome MyGo](https://awesomemygo.dev/badge.svg)](https://awesomemygo.dev/apps/keeps)
+
 ## Features
 
 - Import JPEG, PNG, WebP, GIF, MP4, and MOV files through the file picker,
